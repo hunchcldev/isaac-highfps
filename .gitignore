@@ -1,0 +1,12 @@
+build/
+release/
+
+# Generated from the system winmm.dll by tools/gen_proxy.py; build.bat recreates them.
+src/winmm_thunks.cpp
+src/winmm.def
+
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk

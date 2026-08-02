@@ -1,0 +1,42 @@
+@echo off
+setlocal
+cd /d "%~dp0"
+if not exist build mkdir build
+rem Locate the 32-bit MSVC environment. vswhere ships with every VS 2017+ installer,
+rem so this works for Build Tools, Community, Professional and Enterprise alike.
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+set "VCVARS="
+if exist "%VSWHERE%" (
+    for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * ^
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 ^
+        -property installationPath`) do set "VCVARS=%%i\VC\Auxiliary\Build\vcvars32.bat"
+)
+if not defined VCVARS (
+    echo Could not find a Visual Studio installation with the C++ x86 toolset.
+    echo Install "Desktop development with C++" ^(Build Tools are enough^) and retry.
+    exit /b 1
+)
+call "%VCVARS%" >build\vcvars.log 2>&1
+if errorlevel 1 (echo VCVARS_FAILED - see build\vcvars.log & exit /b 1)
+
+if not exist src\winmm_thunks.cpp (
+    echo generating proxy thunks...
+    python tools\gen_proxy.py >build\gen.log 2>&1
+    if errorlevel 1 (echo GEN_FAILED & type build\gen.log & exit /b 1)
+)
+
+rem The mod ships as winmm.dll: isaac-ng.exe imports winmm statically, so the loader
+rem maps us before main() runs. Uninstall = delete the file.
+cl /nologo /std:c++17 /EHsc /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /LD ^
+   /Fo:build\ /Fe:build\winmm.dll ^
+   src\dllmain.cpp src\winmm_thunks.cpp ^
+   /link /DEF:src\winmm.def >build\dll.log 2>&1
+if errorlevel 1 (echo CL_DLL_FAILED & type build\dll.log & exit /b 1)
+
+rem Dev-only loader. NOT shipped - it exists so we can iterate without reinstalling.
+cl /nologo /std:c++17 /EHsc /O2 /W3 /D_CRT_SECURE_NO_WARNINGS ^
+   /Fo:build\ /Fe:build\inject.exe src\inject.cpp /link user32.lib >build\inject.log 2>&1
+if errorlevel 1 (echo CL_INJECT_FAILED & type build\inject.log & exit /b 1)
+
+echo BUILD_OK
+exit /b 0

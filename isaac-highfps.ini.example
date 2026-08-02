@@ -1,0 +1,19 @@
+; isaac-highfps - optional. Delete this file to use the defaults shown below.
+; Place it next to winmm.dll in the game folder.
+
+[highfps]
+
+; 0 disables the mod entirely without deleting it.
+Enabled = 1
+
+; 0 uncaps the frame rate but skips the intermediate positions, so you get more
+; frames of the same 60 Hz motion. Mostly useful for telling the two effects apart.
+Interpolate = 1
+
+; 0 = run at whatever the display allows. Otherwise a hard cap, e.g. 120.
+; The mod drops to 60 on its own during loads and menus regardless of this.
+MaxFps = 0
+
+; Per-second timings and hitch reports in %TEMP%\isaac-highfps.log.
+; Worth leaving on - it is what makes a bug report actionable.
+Log = 1
