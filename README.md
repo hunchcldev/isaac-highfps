@@ -41,15 +41,6 @@ isn't, which is about the only useful thing Lua can do here.
 Detection needs no interprocess machinery. `MC_POST_RENDER` fires once per rendered frame and
 vanilla is hard-capped at 60, so a sustained rate above that means the native part is live.
 
-Publishing, in order:
-
-1. `package.bat` builds `release\isaac-highfps-<ver>.zip` and leaves the companion ready.
-2. Copy `workshop\isaac-highfps` into the game's `mods\` folder.
-3. Run `tools\ModUploader\ModUploader.exe` from the game directory and upload it.
-4. Steam assigns an id. Paste it back into `metadata.xml` as `<id>`.
-5. `metadata.xml` ships as `Private` on purpose. Publish the GitHub release first, then flip it
-   to `Public`, or subscribers land on a download that doesn't exist yet.
-
 ## Configuration
 
 Optional. Create `isaac-highfps.ini` next to the DLL:
