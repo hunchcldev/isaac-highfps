@@ -1,10 +1,10 @@
 -- High FPS - Workshop companion
 --
--- This mod does not make the game run faster. It cannot: no Lua API can change the render
--- loop, which is why the actual work lives in a native component installed by hand.
--- What this does is tell you whether that component is running, and show you the rates.
+-- This mod does not make the game run faster. It can't. No Lua API reaches the render loop,
+-- which is why the actual work lives in a native component you install by hand. All this
+-- does is tell you whether that component is running, and show you the rates.
 --
--- Detection needs no interprocess anything: MC_POST_RENDER fires once per rendered frame,
+-- Detection needs no interprocess anything. MC_POST_RENDER fires once per rendered frame,
 -- so if it fires appreciably more than 60 times a second, the native part is live.
 
 local mod = RegisterMod("High FPS Companion", 1)

@@ -3,35 +3,38 @@
     <name>High FPS</name>
     <directory>isaac-highfps</directory>
     <description>
-        [b]Isaac renders at a hard 60 FPS and simulates at 30 Hz.[/b] This project lets the renderer run at your monitor's actual refresh rate and fills the frames in between with real interpolated positions — without changing gameplay speed by a single tick.
+        Isaac renders at a hard 60 FPS and simulates at 30 Hz. This project lets the renderer run at your monitor's actual refresh rate and fills the frames in between with real interpolated positions. Game speed does not change by a single tick.
 
-        [h2]⚠️ Read this first[/h2]
-        [b]Subscribing here is not enough.[/b] The Workshop only accepts Lua content mods, and no Lua API can touch the render loop. The part that does the work is a small native component you install by hand — the same situation as [i]REPENTOGON[/i].
+        [h2]Read this first[/h2]
+        [b]Subscribing here is not enough.[/b] The Workshop only accepts Lua content mods, and no Lua API reaches the render loop. The part that does the work is a small native component you install by hand. REPENTOGON has the same problem.
 
-        This Workshop item is the companion: it detects whether the native component is running and tells you if it is not. On its own it changes nothing.
+        This Workshop item is the companion. It detects whether the native component is running and tells you if it isn't. On its own it changes nothing.
 
-        [h2]📦 Installing the native component[/h2]
-        Download it, then drop [b]winmm.dll[/b] next to [b]isaac-ng.exe[/b] in your game folder. That is the whole installation. [b]Uninstalling is deleting that one file.[/b]
+        [h2]Installing the native component[/h2]
+        Download it, then drop [b]winmm.dll[/b] next to [b]isaac-ng.exe[/b] in your game folder. That's the whole installation. To uninstall, delete that one file.
 
-        [url=https://github.com/hunchcldev/isaac-highfps]🔗 Download and source on GitHub[/url]
+        [url=https://github.com/hunchcldev/isaac-highfps]Download and source on GitHub[/url]
 
-        [h2]⚙️ How it works[/h2]
-        The engine's frame limiter is lifted so the loop runs at your display's rate, while the update cadence is pinned to its original timing — both of the game's internal clocks keep advancing exactly as they always did, so nothing about gameplay changes.
+        [h2]How it works[/h2]
+        The engine's frame limiter is lifted so the loop runs at your display's rate, while the update cadence stays pinned to its original timing. Both of the game's internal clocks keep advancing exactly as they always did, so nothing about gameplay changes.
 
-        Every entity except the player is [b]interpolated[/b] between its previous and current real position. The player is extrapolated instead, so your input stays immediate.
+        Every entity except the player is interpolated between its previous and current real position. The player gets extrapolated instead, so your input stays immediate.
 
-        [h2]🧪 Compatibility[/h2]
+        [h2]Beta[/h2]
+        Entity motion is verified. The camera is not: the room scroll offset isn't interpolated yet, so if the camera judders while everything in it moves smoothly, that's the known reason. Reports welcome.
+
+        [h2]Compatibility[/h2]
         [list]
         [*] Built and verified against Repentance+ [b]v1.9.7.17[/b] (32-bit).
-        [*] Every patch site is checked against its expected bytes first. On an unrecognised build [b]nothing is patched at all[/b] and the game runs completely normally.
-        [*] Gameplay speed is unaffected: the logic tick stays at 30/s no matter how high the frame rate goes.
+        [*] Every patch site is checked against its expected bytes first. On a build it doesn't recognise it patches nothing at all and the game runs normally.
+        [*] Game speed is unaffected. The logic tick stays at 30/s no matter how high the frame rate goes.
         [*] Not compatible with other mods that patch the same render loop.
         [/list]
 
-        [h2]🐛 Reporting problems[/h2]
-        The native component writes a log to [b]%TEMP%\isaac-highfps.log[/b] with per-second timings. Please include it when reporting an issue.
+        [h2]Reporting problems[/h2]
+        The native component writes a log to [b]%TEMP%\isaac-highfps.log[/b] with per-second timings. Please include it when you report something.
     </description>
-    <version>1.0.0</version>
+    <version>0.9.0</version>
     <visibility>Private</visibility>
     <tag id="Lua"/>
     <tag id="Graphics"/>

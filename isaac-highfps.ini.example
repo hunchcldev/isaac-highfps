@@ -1,5 +1,5 @@
-; isaac-highfps - optional. Delete this file to use the defaults shown below.
-; Place it next to winmm.dll in the game folder.
+; isaac-highfps, optional. Delete this file to use the defaults shown below.
+; Put it next to winmm.dll in the game folder.
 
 [highfps]
 
@@ -15,5 +15,5 @@ Interpolate = 1
 MaxFps = 0
 
 ; Per-second timings and hitch reports in %TEMP%\isaac-highfps.log.
-; Worth leaving on - it is what makes a bug report actionable.
+; Leave it on. It's what makes a bug report worth anything.
 Log = 1
