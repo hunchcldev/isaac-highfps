@@ -9,6 +9,7 @@
 // therefore unchanged while the render loop runs as fast as the display allows.
 // Motion is still only 60 Hz at this stage — intermediate previews come in milestone B.
 #include <windows.h>
+#include <tlhelp32.h>
 #include <cstdint>
 #include <cstdio>
 #include "offsets.h"
@@ -37,6 +38,9 @@ struct Config {
     int  maxFps = 0;        // 0 = as fast as the display allows
     bool log = true;
     bool profile = false;   // sampling profiler; costs real time, for diagnosis only
+    bool cacheFileProbes = true;
+    bool luaVanillaCadence = true;   // pin mod callbacks to the vanilla 60 Hz
+    bool luaOverlay = true;          // and composite what they draw onto every frame
 } g_cfg;
 
 void LoadConfig() {
@@ -51,6 +55,9 @@ void LoadConfig() {
     g_cfg.maxFps      = GetPrivateProfileIntA("highfps", "MaxFps", 0, path);
     g_cfg.log         = GetPrivateProfileIntA("highfps", "Log", 1, path) != 0;
     g_cfg.profile     = GetPrivateProfileIntA("highfps", "Profile", 0, path) != 0;
+    g_cfg.cacheFileProbes = GetPrivateProfileIntA("highfps", "CacheFileProbes", 1, path) != 0;
+    g_cfg.luaVanillaCadence = GetPrivateProfileIntA("highfps", "LuaVanillaCadence", 1, path) != 0;
+    g_cfg.luaOverlay        = GetPrivateProfileIntA("highfps", "LuaOverlay", 1, path) != 0;
 }
 
 inline uint8_t* Addr(uintptr_t staticVa) {
@@ -111,6 +118,30 @@ double g_statWindow = 0.0;
 bool g_worldAdvancing = false;
 uint32_t g_lastGameFrame = 0;
 double g_frozenSince = 0.0;   // when the gameplay clock last stopped, 0 while running
+
+// True while the render that follows this loop iteration shows an intermediate frame,
+// i.e. one the vanilla engine would never have drawn. The Lua gate reads it.
+volatile LONG g_luaFrameIntermediate = 0;
+volatile LONG g_luaSuppressed = 0;
+volatile LONG g_probeHits = 0, g_probeMisses = 0;
+
+// Overlay state, declared here because the frame loop and the statistics line below both
+// touch it; everything that acts on it lives further down under "lua overlay".
+volatile LONG g_inRenderPhase = 0;
+volatile LONG g_inModRenderPass = 0;   // set while LuaEngine::PostRender is on the stack
+volatile LONG g_pushRate = 0;          // last measured fps, handed to Lua for the companion
+LONG g_overlayScopes = 0, g_overlayBlits = 0;
+bool g_overlayFailed = false;
+void PrepareOverlay();
+volatile LONG g_dirShortcuts = 0;   // probes answered by the missing-directory shortcut
+volatile LONG g_listShortcuts = 0;  // probes answered from a cached directory listing
+
+// Cached negatives are retired wholesale by bumping a generation counter. The game does
+// not create files under resources/ or mods/ while running, but "does not" is not
+// "cannot", and an unbounded cache turns any surprise into a permanent one.
+volatile LONG g_probeGen = 1;
+double g_probeGenAt = 0.0;
+constexpr double kProbeGenSeconds = 5.0;
 
 uint32_t FrameCounter() {
     uintptr_t mgr = *reinterpret_cast<uintptr_t*>(Addr(isaac::kGManagerPtr));
@@ -441,6 +472,11 @@ uint32_t EntityCount() {
 int __cdecl HookedUpdateWrapper() {
     if (!g_gameThreadId) g_gameThreadId = GetCurrentThreadId();
 
+    // Closes the render window from the other side. If the composite hook never fires —
+    // a present path we did not anticipate — this keeps update-phase Lua from being
+    // redirected into a layer that nothing would ever draw to the screen.
+    g_inRenderPhase = 0;
+
     // Pacing. Normally we want the display's full rate — that is the whole point — but
     // there are two reasons to hold back.
     //
@@ -494,23 +530,61 @@ int __cdecl HookedUpdateWrapper() {
         // the render pass, which runs every iteration.
         const double renderAvg = iterAvg - ourAvg - (updAvg * g_prof.updates) / (g_prof.iters ? g_prof.iters : 1);
 
-        Log("[stat] loop=%llu/s wrapper=%llu/s world=%s | iter avg %.2f max %.1f ms |"
+        const LONG hits = InterlockedExchange(&g_probeHits, 0);
+        const LONG misses = InterlockedExchange(&g_probeMisses, 0);
+        if (hits || misses)
+            Log("[files] %ld answered without a syscall (%ld missing dir, %ld from listing), "
+                "%ld went to the kernel (%.0f%% saved)",
+                hits, InterlockedExchange(&g_dirShortcuts, 0),
+                InterlockedExchange(&g_listShortcuts, 0), misses,
+                100.0 * hits / (hits + misses));
+
+        const LONG luaSup = InterlockedExchange(&g_luaSuppressed, 0);
+        const LONG ovScopes = InterlockedExchange(&g_overlayScopes, 0);
+        const LONG ovBlits  = InterlockedExchange(&g_overlayBlits, 0);
+        if (luaSup || ovScopes)
+            Log("[lua] %ld dispatches suppressed on intermediate frames, %ld drawn into the "
+                "overlay, %ld composites%s", luaSup, ovScopes, ovBlits,
+                g_overlayFailed ? "  [overlay DISABLED]" : "");
+
+        // vsync is in here because it is the one thing that silently undoes the whole mod:
+        // we remove the engine's limiter but never touch the GL swap interval, so with vsync
+        // on the loop is pinned to the refresh rate no matter what we patched. When it is on,
+        // loop/s IS the refresh rate, which is the other half of the same diagnosis.
+        const bool vsync = (*reinterpret_cast<uint32_t*>(Addr(isaac::kGWindowFlags)) & 0x200) != 0;
+
+        Log("[stat] loop=%llu/s wrapper=%llu/s world=%s vsync=%s | iter avg %.2f max %.1f ms |"
             " engine-upd avg %.2f max %.1f | render~%.2f | ours avg %.3f max %.2f |"
             " ents<=%u | hitches %u",
             (unsigned long long)g_loopFrames, (unsigned long long)g_wrapperCalls,
-            g_worldAdvancing ? "moving" : "frozen",
+            g_worldAdvancing ? "moving" : "frozen", vsync ? "ON" : "off",
             iterAvg * 1000.0, g_prof.iterMax * 1000.0,
             updAvg * 1000.0, g_prof.updMax * 1000.0,
             renderAvg * 1000.0,
             ourAvg * 1000.0, g_prof.ourMax * 1000.0,
             g_prof.entPeak, g_prof.longFrames);
 
+        // Hand the measured rate to Lua. Mods cannot count frames for themselves any more,
+        // because the callback they would count is exactly the one we pin to 60.
+        g_pushRate = LONG(g_loopFrames);
+
         g_loopFrames = g_wrapperCalls = 0;
         g_prof = Profile{};
         g_statWindow = now;
+
+        // Retire the cached negatives every few seconds. Load bursts finish inside a
+        // second, so the win is already banked by the time an entry expires, and nothing
+        // we cached can outlive its usefulness by more than kProbeGenSeconds.
+        if (now - g_probeGenAt >= kProbeGenSeconds) {
+            InterlockedIncrement(&g_probeGen);
+            g_probeGenAt = now;
+        }
     }
 
     if (now < g_nextWrapper) {
+        // The render following this return shows a frame vanilla never drew, so the
+        // Lua gate swallows every engine->Lua dispatch in it.
+        g_luaFrameIntermediate = 1;
         // Intermediate frame: no logic runs, but we can still show a state the engine
         // never draws — provided the world is actually moving.
         if (g_previewEnabled) {
@@ -539,8 +613,16 @@ int __cdecl HookedUpdateWrapper() {
             g_prof.ourSum += ours;
             if (ours > g_prof.ourMax) g_prof.ourMax = ours;
         }
+        // The render that follows shows the mod layer from the last real frame. Nothing
+        // to clear and nothing for Lua to add, so the flag only matters to the compositor.
+        g_inRenderPhase = 1;
         return 0;
     }
+
+    // Real frame from here on: the engine update below fires the logic callbacks and
+    // the render that follows fires the render callbacks — both exactly on the vanilla
+    // 60 Hz cadence, so Lua must run.
+    g_luaFrameIntermediate = 0;
 
     g_nextWrapper += kWrapperPeriod;
     // After a stall (loading, alt-tab) do not try to replay the missed ticks.
@@ -616,6 +698,11 @@ int __cdecl HookedUpdateWrapper() {
         g_prof.ourSum += ours;
         if (ours > g_prof.ourMax) g_prof.ourMax = ours;
     }
+
+    // A real frame: the render that follows is the one Lua is allowed to draw in, so the
+    // layer it draws into has to exist by the time we get there.
+    PrepareOverlay();
+    g_inRenderPhase = 1;
     return result;
 }
 
@@ -672,15 +759,891 @@ bool RemoveFrameLimiter() {
     return Poke(0x0093135B, kJmpLoopHead, sizeof kJmpLoopHead);
 }
 
+// ------------------------------------------------ file probe cache
+// Profiling a room load shows a steady stream of NtQueryFullAttributesFile - the game
+// asking "does this file exist?". With a stack of mods installed it walks every mod's
+// folder for every single resource, and almost all of those answers are "no". Each one is
+// a full kernel round trip.
+//
+// We cache the negative answers. Only the negatives, and only for paths under the game's
+// own resource and mod folders: save data lives elsewhere and must never be cached, or a
+// freshly written save would look missing.
+//
+// The hook goes in through the import table, so not one byte of game code is modified.
+using GetFileAttrExW_t = BOOL(WINAPI*)(LPCWSTR, GET_FILEEX_INFO_LEVELS, LPVOID);
+GetFileAttrExW_t g_realGetFileAttrExW = nullptr;
+
+// --- directory cache: the one thing the measurement actually supports ---
+//
+// Logging the paths showed what is really happening: for every single resource the game
+// asks all 14 installed mods whether they override it, under both resources/ and
+// resources-dlc3/. That is ~28 probes per resource and virtually every answer is "missing".
+//
+// Every path is distinct, so caching *files* cannot help - and that is exactly why two
+// attempts at it returned 0%. But the directories repeat endlessly: if
+// mods/<X>/resources/sfx/ does not exist, then no file beneath it can, and most mods have
+// no sfx/ and no resources-dlc3/ at all. One directory probe therefore answers thousands
+// of file probes.
+struct DirEntry { uint32_t hash; BOOL exists; };
+constexpr uint32_t kDirSlots = 4096;
+DirEntry g_dirs[kDirSlots] = {};
+
+// Hash the parent directory of a path, i.e. everything before the last separator.
+template <typename CH>
+uint32_t HashParentDir(const CH* path, bool* hasParent) {
+    const CH* lastSep = nullptr;
+    for (const CH* p = path; *p; ++p)
+        if (*p == CH('\\') || *p == CH('/')) lastSep = p;
+    *hasParent = lastSep != nullptr;
+    if (!lastSep) return 0;
+
+    uint32_t h = 2166136261u;
+    for (const CH* p = path; p < lastSep; ++p) {
+        CH c = *p;
+        if (c >= CH('A') && c <= CH('Z')) c += 32;
+        if (c == CH('/')) c = CH('\\');
+        h = (h ^ uint32_t(uint8_t(c))) * 16777619u;
+    }
+    return h ? h : 1;
+}
+
+// Returns true when the parent directory is known not to exist.
+bool ParentDirKnownMissing(uint32_t h) {
+    uint32_t i = h & (kDirSlots - 1);
+    for (uint32_t probe = 0; probe < 8; ++probe, i = (i + 1) & (kDirSlots - 1)) {
+        if (g_dirs[i].hash == h) return !g_dirs[i].exists;
+        if (g_dirs[i].hash == 0) return false;
+    }
+    return false;
+}
+
+bool ParentDirKnown(uint32_t h) {
+    uint32_t i = h & (kDirSlots - 1);
+    for (uint32_t probe = 0; probe < 8; ++probe, i = (i + 1) & (kDirSlots - 1)) {
+        if (g_dirs[i].hash == h) return true;
+        if (g_dirs[i].hash == 0) return false;
+    }
+    return false;
+}
+
+void RememberDir(uint32_t h, BOOL exists) {
+    uint32_t i = h & (kDirSlots - 1);
+    for (uint32_t probe = 0; probe < 8; ++probe, i = (i + 1) & (kDirSlots - 1)) {
+        if (g_dirs[i].hash == 0 || g_dirs[i].hash == h) {
+            g_dirs[i].hash = h;
+            g_dirs[i].exists = exists;
+            return;
+        }
+    }
+}
+
+// Probe the parent directory once, wide path. Cheap: it happens at most once per folder.
+void LearnParentDirW(const wchar_t* path, uint32_t h) {
+    const wchar_t* lastSep = nullptr;
+    for (const wchar_t* p = path; *p; ++p)
+        if (*p == L'\\' || *p == L'/') lastSep = p;
+    if (!lastSep) return;
+    size_t len = size_t(lastSep - path);
+    if (len == 0 || len >= MAX_PATH) return;
+
+    wchar_t dir[MAX_PATH];
+    memcpy(dir, path, len * sizeof(wchar_t));
+    dir[len] = 0;
+
+    WIN32_FILE_ATTRIBUTE_DATA d = {};
+    const BOOL ok = g_realGetFileAttrExW(dir, GetFileExInfoStandard, &d);
+    RememberDir(h, ok && (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY));
+}
+
+
+uint32_t HashPathW(const wchar_t* s) {
+    uint32_t h = 2166136261u;
+    for (; *s; ++s) {
+        wchar_t c = *s;
+        if (c >= L'A' && c <= L'Z') c += 32;
+        if (c == L'/') c = L'\\';
+        h = (h ^ uint32_t(c)) * 16777619u;
+    }
+    return h ? h : 1;
+}
+
+// The directory shortcut answers ~45% of probes. The rest ask about files inside folders
+// that DO exist, and for those the only way to avoid a syscall each is to read the folder
+// once and answer from the listing. Resources do not appear while the game runs, so a
+// listing stays valid for the session.
+constexpr uint32_t kListedSlots = 2048;
+constexpr uint32_t kFileSlots   = 262144;   // hashes only, 1 MB
+uint32_t g_listedDirs[kListedSlots] = {};
+uint32_t g_knownFiles[kFileSlots] = {};
+
+bool SetHas(uint32_t* table, uint32_t slots, uint32_t h) {
+    uint32_t i = h & (slots - 1);
+    for (uint32_t probe = 0; probe < 12; ++probe, i = (i + 1) & (slots - 1)) {
+        if (table[i] == h) return true;
+        if (table[i] == 0) return false;
+    }
+    return false;
+}
+
+void SetAdd(uint32_t* table, uint32_t slots, uint32_t h) {
+    uint32_t i = h & (slots - 1);
+    for (uint32_t probe = 0; probe < 12; ++probe, i = (i + 1) & (slots - 1)) {
+        if (table[i] == 0 || table[i] == h) { table[i] = h; return; }
+    }
+}
+
+// Enumerate one directory and remember every name in it. Returns false if the folder is
+// implausibly large, in which case we simply keep asking the kernel for it.
+bool ListDirectoryW(const wchar_t* path, uint32_t dirHash) {
+    const wchar_t* lastSep = nullptr;
+    for (const wchar_t* p = path; *p; ++p)
+        if (*p == L'\\' || *p == L'/') lastSep = p;
+    if (!lastSep) return false;
+    size_t len = size_t(lastSep - path);
+    if (len == 0 || len + 3 >= MAX_PATH) return false;
+
+    wchar_t pattern[MAX_PATH];
+    memcpy(pattern, path, len * sizeof(wchar_t));
+    pattern[len] = L'\\'; pattern[len + 1] = L'*'; pattern[len + 2] = 0;
+
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    uint32_t count = 0;
+    do {
+        if (fd.cFileName[0] == L'.' &&
+            (fd.cFileName[1] == 0 || (fd.cFileName[1] == L'.' && fd.cFileName[2] == 0)))
+            continue;
+        wchar_t full[MAX_PATH];
+        memcpy(full, path, len * sizeof(wchar_t));
+        full[len] = L'\\';
+        size_t n = wcslen(fd.cFileName);
+        if (len + 1 + n >= MAX_PATH) continue;
+        memcpy(full + len + 1, fd.cFileName, (n + 1) * sizeof(wchar_t));
+        SetAdd(g_knownFiles, kFileSlots, HashPathW(full));
+        if (++count > 8192) { FindClose(h); return false; }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+
+    SetAdd(g_listedDirs, kListedSlots, dirHash);
+    return true;
+}
+
+using AccessFn = int(__cdecl*)(const char*, int);
+AccessFn g_realAccess = nullptr;
+
+constexpr uint32_t kProbeSlots = 16384;
+// Two independent hashes, not one. A single 32-bit key collides often enough across a few
+// thousand resource paths to matter, and a collision here does not cost performance - it
+// reports an existing file as missing, which surfaces as a silently absent sprite.
+struct Probe { uint32_t hash; uint32_t check; uint32_t stamp; };
+Probe g_probes[kProbeSlots] = {};
+
+void HashPathLower(const char* s, uint32_t* h1, uint32_t* h2) {
+    uint32_t a = 2166136261u, b = 2246822519u;
+    for (; *s; ++s) {
+        char c = *s;
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if (c == '/') c = '\\';
+        a = (a ^ uint8_t(c)) * 16777619u;
+        b = (b + uint8_t(c)) * 2654435761u;
+    }
+    *h1 = a ? a : 1;
+    *h2 = b;
+}
+
+// The game's CRT is a different instance from ours, so assigning our own errno would be
+// invisible to it. Poke the one the caller actually reads.
+int* (__cdecl* g_gameErrno)() = nullptr;
+
+void SetGameErrnoNoEnt() {
+    if (g_gameErrno) {
+        if (int* e = g_gameErrno()) *e = ENOENT;
+    }
+}
+
+bool Cacheable(const char* path) {
+    // Cheap case-insensitive substring test; only resource lookups qualify.
+    for (const char* p = path; *p; ++p) {
+        if ((p[0] == 'r' || p[0] == 'R') && _strnicmp(p, "resources", 9) == 0) return true;
+        if ((p[0] == 'm' || p[0] == 'M') && _strnicmp(p, "mods", 4) == 0) return true;
+    }
+    return false;
+}
+
+int __cdecl HookedAccess(const char* path, int mode) {
+    if (!path || !Cacheable(path)) return g_realAccess(path, mode);
+
+    uint32_t h, check;
+    HashPathLower(path, &h, &check);
+    const uint32_t gen = uint32_t(g_probeGen);
+
+    uint32_t i = h & (kProbeSlots - 1);
+    for (uint32_t probe = 0; probe < 8; ++probe, i = (i + 1) & (kProbeSlots - 1)) {
+        const Probe p = g_probes[i];        // one read, so a concurrent write cannot tear
+        if (p.hash == h && p.check == check && p.stamp == gen) {
+            InterlockedIncrement(&g_probeHits);
+            SetGameErrnoNoEnt();
+            return -1;                      // known-missing, no syscall
+        }
+        if (p.hash == 0) break;
+    }
+
+    const int result = g_realAccess(path, mode);
+    const LONG n = InterlockedIncrement(&g_probeMisses);
+    // Two cache attempts have now come back at 0%. Either these paths really are all
+    // distinct - in which case caching is simply the wrong idea and I should stop - or
+    // the table saturates. Sampling the actual strings is the only way to tell, so log a
+    // handful rather than guess a third time.
+    if (n <= 12 || (n % 20000) == 0)
+        Log("[probe#%ld] _access \"%s\" -> %s", n, path, result == 0 ? "exists" : "missing");
+    if (result != 0) {                      // remember misses only
+        i = h & (kProbeSlots - 1);
+        for (uint32_t probe = 0; probe < 8; ++probe, i = (i + 1) & (kProbeSlots - 1)) {
+            if (g_probes[i].hash == 0 || g_probes[i].stamp != gen) {
+                // Stamp last: until it matches the current generation the entry is not
+                // live, so a reader can never see a half-written key.
+                g_probes[i].hash = h;
+                g_probes[i].check = check;
+                g_probes[i].stamp = gen;
+                break;
+            }
+        }
+    }
+    return result;
+}
+
+// Swap one entry in the import table. Returns the original.
+void* HookImport(const char* dllName, const char* funcName, void* replacement) {
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(g_base);
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(g_base + dos->e_lfanew);
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return nullptr;
+
+    auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(g_base + dir.VirtualAddress);
+    for (; desc->Name; ++desc) {
+        const char* mod = reinterpret_cast<const char*>(g_base + desc->Name);
+        if (_stricmp(mod, dllName) != 0) continue;
+
+        auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA32*>(
+            g_base + (desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk));
+        auto* iat = reinterpret_cast<IMAGE_THUNK_DATA32*>(g_base + desc->FirstThunk);
+        for (; thunk->u1.AddressOfData; ++thunk, ++iat) {
+            if (thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG32) continue;
+            auto* byName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(g_base + thunk->u1.AddressOfData);
+            if (strcmp(byName->Name, funcName) != 0) continue;
+
+            void* original = reinterpret_cast<void*>(iat->u1.Function);
+            DWORD old = 0;
+            if (!VirtualProtect(iat, sizeof *iat, PAGE_READWRITE, &old)) return nullptr;
+            iat->u1.Function = reinterpret_cast<DWORD>(replacement);
+            VirtualProtect(iat, sizeof *iat, old, &old);
+            return original;
+        }
+    }
+    return nullptr;
+}
+
+// The measurement said _access was the wrong door: 76k calls, zero repeats, while
+// NtQueryFullAttributesFile sat at 15% of a 290 ms stall. That syscall belongs to
+// GetFileAttributesExW, which the C++ standard library uses for "does this path exist" -
+// and MSVCP140 imports it, not the exe. So the hook has to go into *every* loaded
+// module's import table, not just the game's.
+
+struct AttrEntry {
+    uint32_t hash;
+    BOOL ok;
+    WIN32_FILE_ATTRIBUTE_DATA data;
+};
+constexpr uint32_t kAttrSlots = 32768;
+AttrEntry g_attrs[kAttrSlots] = {};
+
+
+bool CacheableW(const wchar_t* p) {
+    for (; *p; ++p)
+        if ((*p == L'r' || *p == L'R') && _wcsnicmp(p, L"resources", 9) == 0) return true;
+        else if ((*p == L'm' || *p == L'M') && _wcsnicmp(p, L"mods", 4) == 0) return true;
+    return false;
+}
+
+BOOL WINAPI HookedGetFileAttrExW(LPCWSTR path, GET_FILEEX_INFO_LEVELS level, LPVOID out) {
+    if (!path || level != GetFileExInfoStandard || !CacheableW(path))
+        return g_realGetFileAttrExW(path, level, out);
+
+    // Directory shortcut first: if the containing folder does not exist, neither does
+    // the file, and we can answer without touching the kernel at all.
+    bool hasParent = false;
+    const uint32_t dh = HashParentDir(path, &hasParent);
+    if (hasParent) {
+        if (!ParentDirKnown(dh)) LearnParentDirW(path, dh);
+        if (ParentDirKnownMissing(dh)) {
+            InterlockedIncrement(&g_dirShortcuts);
+            InterlockedIncrement(&g_probeHits);
+            SetLastError(ERROR_PATH_NOT_FOUND);
+            return FALSE;
+        }
+        // The folder exists: read it once, then every "is this file in here" question
+        // is a lookup instead of a kernel round trip.
+        if (!SetHas(g_listedDirs, kListedSlots, dh)) ListDirectoryW(path, dh);
+        if (SetHas(g_listedDirs, kListedSlots, dh) &&
+            !SetHas(g_knownFiles, kFileSlots, HashPathW(path))) {
+            InterlockedIncrement(&g_listShortcuts);
+            InterlockedIncrement(&g_probeHits);
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return FALSE;
+        }
+    }
+
+    const uint32_t h = HashPathW(path);
+    uint32_t i = h & (kAttrSlots - 1);
+    for (uint32_t probe = 0; probe < 8; ++probe, i = (i + 1) & (kAttrSlots - 1)) {
+        if (g_attrs[i].hash == h) {
+            InterlockedIncrement(&g_probeHits);
+            if (!g_attrs[i].ok) { SetLastError(ERROR_FILE_NOT_FOUND); return FALSE; }
+            *static_cast<WIN32_FILE_ATTRIBUTE_DATA*>(out) = g_attrs[i].data;
+            return TRUE;
+        }
+        if (g_attrs[i].hash == 0) break;
+    }
+
+    const BOOL ok = g_realGetFileAttrExW(path, level, out);
+    const LONG n = InterlockedIncrement(&g_probeMisses);
+    if (n <= 12 || (n % 20000) == 0)
+        Log("[probe#%ld] GetFileAttributesExW \"%S\" -> %s", n, path, ok ? "exists" : "missing");
+    // Game resources do not change while the game runs, so both answers are safe to keep.
+    i = h & (kAttrSlots - 1);
+    for (uint32_t probe = 0; probe < 8; ++probe, i = (i + 1) & (kAttrSlots - 1)) {
+        if (g_attrs[i].hash == 0) {
+            g_attrs[i].hash = h;
+            g_attrs[i].ok = ok;
+            if (ok) g_attrs[i].data = *static_cast<WIN32_FILE_ATTRIBUTE_DATA*>(out);
+            break;
+        }
+    }
+    return ok;
+}
+
+// Patch one import across every module currently loaded in the process.
+int HookImportEverywhere(const char* funcName, void* replacement, void** originalOut) {
+    int patched = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    MODULEENTRY32W me = {sizeof me};
+    for (BOOL more = Module32FirstW(snap, &me); more; more = Module32NextW(snap, &me)) {
+        auto modBase = reinterpret_cast<uintptr_t>(me.modBaseAddr);
+        if (modBase == reinterpret_cast<uintptr_t>(g_self)) continue;   // never ourselves
+        __try {
+            auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(modBase);
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE) continue;
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(modBase + dos->e_lfanew);
+            if (nt->Signature != IMAGE_NT_SIGNATURE) continue;
+            const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+            if (!dir.VirtualAddress) continue;
+
+            for (auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(modBase + dir.VirtualAddress);
+                 desc->Name; ++desc) {
+                auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA32*>(
+                    modBase + (desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk));
+                auto* iat = reinterpret_cast<IMAGE_THUNK_DATA32*>(modBase + desc->FirstThunk);
+                for (; thunk->u1.AddressOfData; ++thunk, ++iat) {
+                    if (thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG32) continue;
+                    auto* byName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(modBase + thunk->u1.AddressOfData);
+                    if (strcmp(byName->Name, funcName) != 0) continue;
+                    if (reinterpret_cast<void*>(iat->u1.Function) == replacement) continue;
+                    if (originalOut && !*originalOut)
+                        *originalOut = reinterpret_cast<void*>(iat->u1.Function);
+                    DWORD old = 0;
+                    if (VirtualProtect(iat, sizeof *iat, PAGE_READWRITE, &old)) {
+                        iat->u1.Function = reinterpret_cast<DWORD>(replacement);
+                        VirtualProtect(iat, sizeof *iat, old, &old);
+                        ++patched;
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { /* skip malformed module */ }
+    }
+    CloseHandle(snap);
+    return patched;
+}
+
+bool InstallFileCache() {
+    // Our CRT is a separate instance from the game's, so setting our own errno would be
+    // invisible to the caller. Resolve theirs. Every _access caller we know of checks the
+    // return value, so this is belt-and-braces rather than load-bearing.
+    if (HMODULE crt = GetModuleHandleA("api-ms-win-crt-runtime-l1-1-0.dll"))
+        g_gameErrno = reinterpret_cast<int*(__cdecl*)()>(GetProcAddress(crt, "_errno"));
+    if (!g_gameErrno)
+        if (HMODULE crt = GetModuleHandleA("ucrtbase.dll"))
+            g_gameErrno = reinterpret_cast<int*(__cdecl*)()>(GetProcAddress(crt, "_errno"));
+
+    g_realAccess = reinterpret_cast<AccessFn>(
+        HookImport("api-ms-win-crt-filesystem-l1-1-0.dll", "_access",
+                   reinterpret_cast<void*>(&HookedAccess)));
+
+    void* orig = nullptr;
+    const int n = HookImportEverywhere("GetFileAttributesExW",
+                                       reinterpret_cast<void*>(&HookedGetFileAttrExW), &orig);
+    if (orig) g_realGetFileAttrExW = reinterpret_cast<GetFileAttrExW_t>(orig);
+    if (!g_realGetFileAttrExW)   // nobody imported it by name; go straight to the export
+        g_realGetFileAttrExW = reinterpret_cast<GetFileAttrExW_t>(
+            GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetFileAttributesExW"));
+
+    Log("file cache: GetFileAttributesExW patched in %d import slots", n);
+    return g_realGetFileAttrExW != nullptr;
+}
+
+// ----------------------------------------------------------- lua overlay
+// Suppressing Lua on intermediate frames keeps mod code at the vanilla cadence, but it
+// also means everything mods DRAW exists on one frame in three. At 180 Hz that reads as
+// flicker across every mod HUD in the game.
+//
+// The fix is to stop treating mod graphics as part of the frame and give them a surface
+// of their own. On a real frame each Lua dispatch is bracketed: flush whatever the engine
+// has queued, bind our own render target, let Lua draw into it, flush again, unbind. At
+// the end of every frame — real or intermediate — that surface is composited over the
+// finished image. Mod graphics are therefore present on all 180 frames while their Lua
+// still runs exactly 60 times a second.
+//
+// None of this is our own rendering. It is the engine's own post-processing recipe,
+// copied from the "Colormod Surface" path in sub_6FBC10, pointed at one more surface.
+struct KColor   { float r, g, b, a; int32_t unk; };                       // 0x14
+struct SrcQuad  { float tl[2], tr[2], bl[2], br[2]; int32_t space; };     // 0x24
+struct DestQuad { float p[8]; KColor c[4]; };                             // 0x70
+struct SmartImage { void* image; void* counter; };
+
+using PushRtFn   = void(__cdecl*)();
+using PopRtFn    = void(__cdecl*)();
+using SetRtFn    = void(__fastcall*)(void* mgr, void* edx, void* target, int screenSized);
+using ClearFn    = void(__fastcall*)(void* mgr, void* edx);
+using FlushFn    = void(__fastcall*)(void* mgr, void* edx, int one);
+using SelShaderFn= void(__stdcall*)(int);
+using CreateRtFn = SmartImage*(__stdcall*)(SmartImage*, uint32_t, uint32_t, const char*, KColor*);
+using ImgRenderFn= void(__fastcall*)(void* img, void* edx, SrcQuad*, DestQuad*, KColor*);
+using ImgFilterFn= void(__fastcall*)(void* img, void* edx, int minF, int magF);
+
+PushRtFn    g_pushRt   = nullptr;
+PopRtFn     g_popRt    = nullptr;
+SetRtFn     g_setRt    = nullptr;
+ClearFn     g_clearRt  = nullptr;
+FlushFn     g_flushRt  = nullptr;
+CreateRtFn  g_createRt = nullptr;
+
+void*     g_overlay = nullptr;     // the ImageBase* we draw mod output into
+SmartImage g_overlayRef = {};      // held for the process lifetime, deliberately never released
+uint32_t  g_overlayW = 0, g_overlayH = 0;
+
+inline void* Mgr() { return Addr(isaac::kGraphicsManager); }
+
+// A fault in here is a wrong address or a wrong assumption about engine state, and the
+// only useful thing to know is which of the two and where. Naming the faulting
+// instruction as a static VA makes it a lookup in the disassembly rather than a guess.
+int OverlayFault(const char* where, EXCEPTION_POINTERS* ep) {
+    char desc[160] = "(no context)";
+    DWORD code = 0;
+    if (ep && ep->ExceptionRecord) {
+        code = ep->ExceptionRecord->ExceptionCode;
+        DescribeAddress(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
+            ep->ExceptionRecord->ExceptionAddress)), desc, sizeof desc);
+    }
+    Log("[overlay] fault in %s: code 0x%08X at %s - overlay disabled for this session",
+        where, code, desc);
+    g_overlayFailed = true;
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// Clear() resets the manager's blend state and picks its own shader. The engine does that
+// at every target switch of its own, but we switch in the middle of someone else's frame,
+// so we put back exactly what we found.
+struct GraphicsState {
+    uint32_t blend[5];
+    uint32_t shader;
+    void Save() {
+        memcpy(blend, Addr(isaac::kGraphicsManager + isaac::kMgrBlendState), sizeof blend);
+        shader = *reinterpret_cast<uint32_t*>(Addr(isaac::kCurrentShader));
+    }
+    void Restore() const {
+        memcpy(Addr(isaac::kGraphicsManager + isaac::kMgrBlendState), blend, sizeof blend);
+        *reinterpret_cast<uint32_t*>(Addr(isaac::kCurrentShader)) = shader;
+    }
+};
+
+// GPU resources may only be created on the thread that owns the GL context, so every
+// caller of this sits on the game thread. Called again after a resolution change, which
+// is why it compares against the size it last built for.
+bool EnsureOverlay() {
+    if (g_overlayFailed || !g_createRt) return false;
+    const uint32_t w = *reinterpret_cast<uint32_t*>(Addr(isaac::kScreenWidth));
+    const uint32_t h = *reinterpret_cast<uint32_t*>(Addr(isaac::kScreenHeight));
+    if (w == 0 || h == 0 || w > 16384 || h > 16384) return false;   // graphics not up yet
+    if (g_overlay && w == g_overlayW && h == g_overlayH) return true;
+
+    KColor transparent = {0, 0, 0, 0, 0};
+    SmartImage created = {};
+    g_createRt(&created, w, h, "isaac-highfps Lua overlay", &transparent);
+    if (!created.image) {
+        Log("[overlay] render target creation failed at %ux%u", w, h);
+        return false;
+    }
+    // The previous surface (if this is a resize) keeps its reference and is dropped by the
+    // engine's own accounting. One surface per resolution change is not a leak worth code.
+    g_overlayRef = created;
+    g_overlay = created.image;
+
+    auto** vt = *reinterpret_cast<void***>(g_overlay);
+    reinterpret_cast<ImgFilterFn>(vt[isaac::kVtImageSetFilter])(g_overlay, nullptr, 1, 1);
+    *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(g_overlay) + isaac::kImgFilterCacheMin) = 1;
+    *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(g_overlay) + isaac::kImgFilterCacheMag) = 1;
+
+    g_overlayW = w; g_overlayH = h;
+    Log("[overlay] surface ready: %ux%u at 0x%08X", w, h, (unsigned)(uintptr_t)g_overlay);
+    return true;
+}
+
+// Binds the overlay for the duration of the mod render pass. The flush on the way in
+// matters as much as the one on the way out: batches the engine queued for ITS target must
+// be drained before we rebind, or they would land in ours.
+//
+// Exactly one of these per frame. The first version wrapped every single Lua dispatch,
+// which cost the frame rate the whole point of this mod and made the game's own UI
+// flicker — a flush forces the engine to emit its queued geometry early, so doing it
+// dozens of times a frame both destroys batching and reorders the draws.
+class OverlayScope {
+public:
+    OverlayScope() {
+        if (!g_cfg.luaOverlay || g_overlayFailed || !g_inRenderPhase) return;
+        if (g_luaFrameIntermediate) return;   // the gate holds Lua back, nothing will draw
+        if (GetCurrentThreadId() != g_gameThreadId) return;   // only the GL-owning thread
+        __try {
+            if (!EnsureOverlay()) return;
+            m_state.Save();
+            // The one flush that is genuinely required: a batch is drawn into whatever
+            // target is bound when it is FLUSHED, not when it was queued, so anything the
+            // engine still has pending has to be emitted before we rebind.
+            g_flushRt(Mgr(), nullptr, 1);
+            g_pushRt();
+            g_setRt(Mgr(), nullptr, g_overlay, 1);
+            // Wipe last frame's mod output while we are already bound, rather than paying
+            // for a second push/bind/pop earlier in the frame just to do this.
+            g_clearRt(Mgr(), nullptr);
+            m_active = true;
+            InterlockedIncrement(&g_overlayScopes);
+        } __except (OverlayFault("bind", GetExceptionInformation())) {}
+    }
+    ~OverlayScope() {
+        if (!m_active) return;
+        __try {
+            g_flushRt(Mgr(), nullptr, 1);
+            g_popRt();
+            m_state.Restore();
+        } __except (OverlayFault("unbind", GetExceptionInformation())) {}
+    }
+    OverlayScope(const OverlayScope&) = delete;
+    OverlayScope& operator=(const OverlayScope&) = delete;
+private:
+    GraphicsState m_state = {};
+    bool m_active = false;
+};
+
+// The surface has to exist before the gate is allowed to hold Lua back, and creating it
+// is only legal on the thread that owns the GL context. Doing it here, once per real
+// frame from the game thread, keeps that guarantee without any work in the steady state.
+void PrepareOverlay() {
+    if (!g_cfg.luaOverlay || g_overlayFailed || g_overlay) return;
+    __try {
+        EnsureOverlay();
+    } __except (OverlayFault("create", GetExceptionInformation())) {}
+}
+
+// Composite the mod layer onto whatever the engine currently has bound. Same call the
+// engine uses to put its own Colormod surface on the screen: a 0..1 source quad, a
+// full-screen destination, and the blend state it uses for its own composites.
+void BlitOverlay() {
+    if (!g_overlay) return;
+    const float w = *reinterpret_cast<float*>(Addr(isaac::kOrthoWidth));
+    const float h = *reinterpret_cast<float*>(Addr(isaac::kOrthoHeight));
+    if (!(w > 0.0f) || !(h > 0.0f)) return;
+
+    SrcQuad src = {{0, 0}, {1, 0}, {0, 1}, {1, 1}, 0};
+    KColor white = {1, 1, 1, 1, 0};
+    DestQuad dst = {};
+    dst.p[0] = 0; dst.p[1] = 0;   // top left
+    dst.p[2] = w; dst.p[3] = 0;   // top right
+    dst.p[4] = 0; dst.p[5] = h;   // bottom left
+    dst.p[6] = w; dst.p[7] = h;   // bottom right
+    for (int i = 0; i < 4; ++i) dst.c[i] = white;
+
+    // No flush around this one. A state change does not reach back into batches that are
+    // already queued — the engine starts a new batch when the state differs — so our quad
+    // simply joins the stream and goes out with everything else at the engine's own flush,
+    // while the target it belongs to is still bound.
+    GraphicsState st; st.Save();
+    auto* blend = reinterpret_cast<uint32_t*>(Addr(isaac::kGraphicsManager + isaac::kMgrBlendState));
+    blend[0] = 0;
+    blend[1] = (*reinterpret_cast<uint32_t*>(Addr(isaac::kGWindowFlags)) & 4) ? 1u : 6u;
+    blend[2] = 7;
+    blend[3] = 1;
+    blend[4] = 7;
+
+    // Once, so the geometry is on record rather than assumed: if the quad we draw is not
+    // the size of the target it lands in, the mod layer is scaled or clipped and no amount
+    // of staring at the composite logic will show it.
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        Log("[overlay] first composite: layer %ux%u, quad %.0fx%.0f, target 0x%08X",
+            g_overlayW, g_overlayH, w, h,
+            *reinterpret_cast<uint32_t*>(Addr(isaac::kGraphicsManager + isaac::kMgrCurRenderTgt)));
+    }
+
+    auto** vt = *reinterpret_cast<void***>(g_overlay);
+    reinterpret_cast<ImgRenderFn>(vt[isaac::kVtImageRender])(g_overlay, nullptr, &src, &dst, &white);
+    st.Restore();
+    InterlockedIncrement(&g_overlayBlits);
+}
+
+// The composite point.
+//
+// The first attempt did this at SwapBuffers and faulted on the very first frame: by then
+// the engine has finished with the frame's render batches, so a fresh draw has nothing to
+// attach to. LuaEngine::PostRender is the opposite — it is the moment the engine hands the
+// finished world to mods precisely so they can draw on it. Drawing here cannot be
+// ill-timed, and it inherits the z-order mod graphics have always had, colormod included.
+//
+// On a real frame the Lua inside draws into our layer (the gate is open, so OverlayScope
+// redirects it); on an intermediate frame the gate swallows it and the layer still holds
+// what the last real frame produced. Either way the same composite follows, so mod
+// graphics are on all 180 frames while their Lua ran 60 times.
+using LuaPostRenderFn = int(__cdecl*)();
+LuaPostRenderFn g_luaPostRenderTramp = nullptr;
+
+void CompositeOverlay() {
+    if (!g_cfg.luaOverlay || g_overlayFailed || !g_overlay) return;
+    __try {
+        BlitOverlay();
+    } __except (OverlayFault("composite", GetExceptionInformation())) {}
+}
+
+int __cdecl HookedLuaPostRender() {
+    int result;
+    {
+        OverlayScope draws;                 // inactive on intermediate frames
+        g_inModRenderPass = 1;              // the gate only bites inside this pass
+        result = g_luaPostRenderTramp();
+        g_inModRenderPass = 0;
+    }
+    CompositeOverlay();
+    return result;
+}
+
+bool InstallOverlay() {
+    // We call these rather than patch them, but calling the wrong address is worse than
+    // patching it, so each one has to identify itself first. Only the leading bytes are
+    // compared: anything further in tends to be an absolute address the loader rebases.
+    static const uint8_t kPush[]   = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08};
+    static const uint8_t kPop[]    = {0x51, 0x83, 0x3D};
+    static const uint8_t kSetRt[]  = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x56};
+    // `cmp dword [esi+68h], 0` — also proves currentRenderTarget still sits at +0x68.
+    static const uint8_t kClear[]  = {0x56, 0x8B, 0xF1, 0x83, 0x7E, 0x68, 0x00, 0x74};
+    static const uint8_t kFlush[]  = {0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08, 0x83, 0xE4};
+    static const uint8_t kCreate[] = {0x55, 0x8B, 0xEC, 0x6A, 0xFF};
+    if (!Expect(isaac::kPushRenderTarget, kPush,  sizeof kPush,  "PushRenderTarget")  ||
+        !Expect(isaac::kPopRenderTarget,  kPop,   sizeof kPop,   "PopRenderTarget")   ||
+        !Expect(isaac::kSetRenderTarget,  kSetRt, sizeof kSetRt, "SetRenderTarget")   ||
+        !Expect(isaac::kClearTarget,      kClear, sizeof kClear, "ClearRenderTarget") ||
+        !Expect(isaac::kFlushBatches,     kFlush, sizeof kFlush, "FlushRenderBatches")||
+        !Expect(isaac::kCreateRenderTgt,  kCreate,sizeof kCreate,"CreateRenderTarget"))
+        return false;
+
+    g_pushRt   = reinterpret_cast<PushRtFn  >(Addr(isaac::kPushRenderTarget));
+    g_popRt    = reinterpret_cast<PopRtFn   >(Addr(isaac::kPopRenderTarget));
+    g_setRt    = reinterpret_cast<SetRtFn   >(Addr(isaac::kSetRenderTarget));
+    g_clearRt  = reinterpret_cast<ClearFn   >(Addr(isaac::kClearTarget));
+    g_flushRt  = reinterpret_cast<FlushFn   >(Addr(isaac::kFlushBatches));
+    g_createRt = reinterpret_cast<CreateRtFn>(Addr(isaac::kCreateRenderTgt));
+
+    // Detour LuaEngine::PostRender for the composite. Its prologue is push ebp / mov ebp,
+    // esp / push -1, which is exactly five bytes and ends on an instruction boundary.
+    static const uint8_t kPostRender[] = {0x55, 0x8B, 0xEC, 0x6A, 0xFF};
+    if (!Expect(isaac::kLuaPostRender, kPostRender, sizeof kPostRender, "LuaEngine::PostRender"))
+        return false;
+
+    uint8_t* site = Addr(isaac::kLuaPostRender);
+    auto* tramp = static_cast<uint8_t*>(
+        VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!tramp) return false;
+    memcpy(tramp, site, sizeof kPostRender);
+    WriteRel32Jmp(tramp + sizeof kPostRender, site + sizeof kPostRender);
+    g_luaPostRenderTramp = reinterpret_cast<LuaPostRenderFn>(tramp);
+
+    uint8_t patch[5] = {0xE9};
+    *reinterpret_cast<int32_t*>(patch + 1) = static_cast<int32_t>(
+        reinterpret_cast<uintptr_t>(&HookedLuaPostRender) - (reinterpret_cast<uintptr_t>(site) + 5));
+    return Poke(isaac::kLuaPostRender, patch, sizeof patch);
+}
+
+// -------------------------------------------------------------- lua gate
+// Vanilla fires every Lua render callback once per 60 Hz frame. Our free-running loop
+// renders three times as often, which without this gate fires MC_POST_RENDER and friends
+// three times as often too — tripling every installed mod's Lua render cost, and silently
+// breaking mods that keep frame counters or game logic inside render callbacks (a common
+// workaround, since render callbacks were long the only per-frame hook available).
+//
+// Every engine->Lua dispatch — all 51 call sites of the callback surface — funnels
+// through two imports: lua_pcallk and lua_callk. On intermediate frames we emulate the
+// call instead of making it: drop the callee and its arguments from the Lua stack, push
+// the requested number of nils, report LUA_OK. To the caller that is indistinguishable
+// from "no mod registered anything", a case every call site already handles. Real frames
+// pass through untouched. Mod Lua therefore runs exactly 60 times per second, in vanilla
+// order, against vanilla game state — the invariant is restored, not worked around.
+//
+// Known cost until the overlay layer lands: what mods DRAW inside those callbacks exists
+// only on real frames, so mod graphics flicker at high fps. LuaVanillaCadence=0 trades
+// back: smooth mod graphics, triple Lua cost, render-callback logic runs fast again.
+//
+// Not covered: lua_resume (coroutines). The engine's callback dispatch does not use it.
+using LuaGettopFn  = int (__cdecl*)(void*);
+using LuaSettopFn  = void(__cdecl*)(void*, int);
+using LuaPushnilFn = void(__cdecl*)(void*);
+using LuaPushIntFn = void(__cdecl*)(void*, intptr_t);
+using LuaSetGlobalFn = void(__cdecl*)(void*, const char*);
+using LuaPcallkFn  = int (__cdecl*)(void*, int, int, int, intptr_t, void*);
+using LuaCallkFn   = void(__cdecl*)(void*, int, int, intptr_t, void*);
+
+LuaGettopFn  g_luaGettop  = nullptr;
+LuaSettopFn  g_luaSettop  = nullptr;
+LuaPushnilFn g_luaPushnil = nullptr;
+LuaPushIntFn g_luaPushInt = nullptr;
+LuaSetGlobalFn g_luaSetGlobal = nullptr;
+LuaPcallkFn  g_realPcallk = nullptr;
+LuaCallkFn   g_realCallk  = nullptr;
+
+// Lua runs on the game thread only; anything else calling in (there should be nothing)
+// passes through untouched rather than getting its stack rearranged mid-flight.
+//
+// Only the mod render pass is held back, not every callback in the frame. That pass is
+// where the expensive HUD work lives (item descriptions, stat trackers) and where mods
+// have historically parked logic for want of a better hook, so it is the one that has to
+// keep the vanilla 60 Hz — and it is the one whose output we can composite.
+//
+// The per-entity render callbacks are deliberately left alone. They are cheap, they draw
+// relative to an entity whose position we are already interpolating, and letting them run
+// per frame means they track that movement instead of being pinned to 60 Hz. Bracketing
+// them was the first attempt and it cost more than it bought: they are interleaved with
+// the engine's own geometry, so redirecting them means flushing the batch queue dozens of
+// times a frame, which took the frame rate down with it.
+// Holding the pass back is only ever correct while the layer that carries its output is
+// actually live. If the overlay is off or has faulted, letting Lua run on every frame
+// costs performance but shows the right picture, and that is the better failure.
+bool SuppressLuaNow() {
+    return g_luaFrameIntermediate && g_inModRenderPass &&
+           g_cfg.luaOverlay && !g_overlayFailed && g_overlay != nullptr &&
+           GetCurrentThreadId() == g_gameThreadId;
+}
+
+// Balance the stack exactly like a successful call that returned nothing: the callee
+// and its nargs arguments come off, nresults nils go on. LUA_MULTRET (-1) callers
+// accept zero results as-is, so the loop simply does not run for them.
+void EmulateLuaCall(void* L, int nargs, int nresults) {
+    g_luaSettop(L, g_luaGettop(L) - nargs - 1);
+    for (int i = 0; i < nresults; ++i) g_luaPushnil(L);
+    InterlockedIncrement(&g_luaSuppressed);
+}
+
+// Announce ourselves inside the Lua VM.
+//
+// The Workshop companion used to detect us by counting MC_POST_RENDER: more than 60 a
+// second meant the native part was live. The gate above deliberately ends that — the
+// callback is pinned to 60 now — so counting frames would report "not installed" on a
+// perfectly working install. Two globals replace it, and they also let the companion show
+// the real frame rate, which it can no longer measure for the same reason.
+//
+// Both are set from inside a dispatch, where a valid lua_State is in hand. Each push is
+// balanced by the setglobal that pops it, so the stack the engine is mid-call on is
+// untouched. Keyed on the state pointer, so a reloaded VM gets them again.
+constexpr intptr_t kNativeApiVersion = 2;
+
+void* g_lastLuaState = nullptr;
+LONG g_publishedRate = 0;
+
+void PublishPresence(void* L) {
+    if (!g_luaPushInt || !g_luaSetGlobal || !L) return;
+    if (L != g_lastLuaState) {
+        g_lastLuaState = L;
+        g_publishedRate = -1;               // force the rate out again for the new VM
+        g_luaPushInt(L, kNativeApiVersion);
+        g_luaSetGlobal(L, "HIGH_FPS_NATIVE");
+    }
+    const LONG rate = g_pushRate;
+    if (rate != g_publishedRate) {
+        g_publishedRate = rate;
+        g_luaPushInt(L, rate);
+        g_luaSetGlobal(L, "HIGH_FPS_RATE");
+    }
+}
+
+int __cdecl HookedPcallk(void* L, int nargs, int nresults, int msgh, intptr_t ctx, void* k) {
+    if (SuppressLuaNow()) { EmulateLuaCall(L, nargs, nresults); return 0; /* LUA_OK */ }
+    PublishPresence(L);
+    return g_realPcallk(L, nargs, nresults, msgh, ctx, k);
+}
+
+void __cdecl HookedCallk(void* L, int nargs, int nresults, intptr_t ctx, void* k) {
+    if (SuppressLuaNow()) { EmulateLuaCall(L, nargs, nresults); return; }
+    PublishPresence(L);
+    g_realCallk(L, nargs, nresults, ctx, k);
+}
+
+bool InstallLuaGate() {
+    HMODULE lua = GetModuleHandleA("Lua5.3.3r.dll");
+    if (!lua) return false;
+    g_luaGettop  = reinterpret_cast<LuaGettopFn >(GetProcAddress(lua, "lua_gettop"));
+    g_luaSettop  = reinterpret_cast<LuaSettopFn >(GetProcAddress(lua, "lua_settop"));
+    g_luaPushnil = reinterpret_cast<LuaPushnilFn>(GetProcAddress(lua, "lua_pushnil"));
+    if (!g_luaGettop || !g_luaSettop || !g_luaPushnil) return false;
+    // Optional: without these the gate still works, mods just cannot see that we are here.
+    g_luaPushInt   = reinterpret_cast<LuaPushIntFn  >(GetProcAddress(lua, "lua_pushinteger"));
+    g_luaSetGlobal = reinterpret_cast<LuaSetGlobalFn>(GetProcAddress(lua, "lua_setglobal"));
+    if (!g_luaPushInt || !g_luaSetGlobal)
+        Log("[warn] lua_pushinteger/lua_setglobal missing - mods cannot detect the native part");
+
+    g_realPcallk = reinterpret_cast<LuaPcallkFn>(
+        HookImport("Lua5.3.3r.dll", "lua_pcallk", reinterpret_cast<void*>(&HookedPcallk)));
+    if (!g_realPcallk) return false;
+    g_realCallk = reinterpret_cast<LuaCallkFn>(
+        HookImport("Lua5.3.3r.dll", "lua_callk", reinterpret_cast<void*>(&HookedCallk)));
+    if (!g_realCallk) {
+        // Half a gate is worse than none: put the first hook back.
+        HookImport("Lua5.3.3r.dll", "lua_pcallk", reinterpret_cast<void*>(g_realPcallk));
+        g_realPcallk = nullptr;
+        return false;
+    }
+    return true;
+}
+
 DWORD WINAPI Init(LPVOID) {
     LoadConfig();
     if (!g_cfg.enabled) return 0;
 
     if (g_cfg.log) {
-        char logPath[MAX_PATH];
-        GetTempPathA(MAX_PATH, logPath);
-        strcat(logPath, "isaac-highfps.log");
-        g_log = fopen(logPath, "w");
+        // Wide paths throughout, and a fallback next to the DLL.
+        //
+        // Both halves of this are the same bug report. The ANSI versions silently fail when
+        // the user's profile or install path holds characters their codepage cannot carry,
+        // which is easy to have on a non-English Windows and impossible to have on ours. A
+        // failed fopen leaves g_log null, and that switches off every diagnostic we have,
+        // including the FATAL lines that would say why nothing was patched. The symptom is
+        // "no log at all", which is also what a DLL that never loaded looks like.
+        wchar_t logPath[MAX_PATH * 2];
+        if (GetTempPathW(MAX_PATH, logPath)) {
+            wcscat(logPath, L"isaac-highfps.log");
+            g_log = _wfopen(logPath, L"w");
+        }
+        if (!g_log && GetModuleFileNameW(g_self, logPath, MAX_PATH)) {
+            if (wchar_t* slash = wcsrchr(logPath, L'\\')) slash[1] = 0;
+            wcscat(logPath, L"isaac-highfps.log");
+            g_log = _wfopen(logPath, L"w");
+        }
     }
 
     g_base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
@@ -725,6 +1688,32 @@ DWORD WINAPI Init(LPVOID) {
     if (g_cfg.profile) {
         CreateThread(nullptr, 0, SamplerThread, nullptr, 0, nullptr);
         Log("sampling profiler armed - hitches will dump their hottest addresses");
+    }
+
+    if (g_cfg.cacheFileProbes)
+        Log(InstallFileCache() ? "file-probe cache installed (_access via import table)"
+                               : "[warn] could not hook _access - file-probe cache off");
+
+    if (g_cfg.luaVanillaCadence) {
+        const bool gate = InstallLuaGate();
+        Log(gate ? "lua gate installed (lua_pcallk/lua_callk via import table) - "
+                   "mod callbacks pinned to the vanilla 60 Hz cadence"
+                 : "[warn] lua gate failed - mod callbacks will fire per rendered frame");
+
+        // The overlay only has a job while the gate is holding Lua back. Without the gate
+        // mods already draw on every frame and there is nothing to carry over.
+        if (gate && g_cfg.luaOverlay) {
+            if (InstallOverlay()) {
+                Log("lua overlay armed - mod graphics will be composited onto every frame");
+            } else {
+                g_overlayFailed = true;
+                Log("[warn] lua overlay could not install - mod graphics will only appear on "
+                    "real frames (set LuaVanillaCadence=0 if that flickers)");
+            }
+        } else if (gate) {
+            g_overlayFailed = true;
+            Log("lua overlay off by config - mod graphics update at 60 Hz and may flicker");
+        }
     }
 
     g_previewEnabled = g_cfg.interpolate;

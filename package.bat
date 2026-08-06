@@ -4,7 +4,7 @@ rem   release\isaac-highfps-<ver>.zip   the native component users install by ha
 rem   workshop\isaac-highfps\           the Workshop companion, ready for ModUploader
 setlocal
 cd /d "%~dp0"
-set VER=0.9.0
+set VER=0.10.0
 
 call "%~dp0build.bat" || exit /b 1
 

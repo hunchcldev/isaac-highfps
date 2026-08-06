@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<!-- Steam Workshop preview, 512x512. Render with:
+     chrome --headless=new --screenshot=preview.png --window-size=512,512 art/preview.html -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    width: 512px; height: 512px;
+    overflow: hidden;
+    background: #0b0705;
+  }
+
+  /* Basement floor: dirty brown over near-black, lit from above like the game's rooms. */
+  .room {
+    position: relative;
+    width: 512px; height: 512px;
+    background:
+      radial-gradient(ellipse 70% 55% at 50% 34%, #6b4a33 0%, #4a3122 38%, #2a1a12 68%, #120b07 100%),
+      #0b0705;
+    font-family: "Bookman Old Style", "Georgia", "Times New Roman", serif;
+    overflow: hidden;
+  }
+
+  /* Grime. Two offset dot grids beat a flat gradient for the grubby look. */
+  .grime {
+    position: absolute; inset: 0;
+    background-image:
+      radial-gradient(circle at 20% 30%, rgba(0,0,0,.34) 0 2px, transparent 3px),
+      radial-gradient(circle at 70% 60%, rgba(0,0,0,.28) 0 3px, transparent 4px),
+      radial-gradient(circle at 45% 85%, rgba(0,0,0,.30) 0 2px, transparent 3px);
+    background-size: 37px 41px, 53px 47px, 29px 31px;
+    mix-blend-mode: multiply;
+  }
+
+  /* Heavy vignette, the game is always darkest at the edges. */
+  .vignette {
+    position: absolute; inset: 0;
+    background: radial-gradient(ellipse 62% 62% at 50% 46%, transparent 42%, rgba(0,0,0,.82) 100%);
+  }
+
+  /* Blood running down from the top edge. */
+  .drips { position: absolute; top: 0; left: 0; width: 512px; height: 130px; }
+
+  .title-wrap {
+    position: absolute; top: 62px; left: 0; width: 512px;
+    text-align: center;
+  }
+
+  h1 {
+    font-size: 78px;
+    line-height: .92;
+    font-weight: 700;
+    letter-spacing: -1px;
+    color: #f2e3c8;
+    text-shadow:
+      -4px -4px 0 #140b07,  4px -4px 0 #140b07,
+      -4px  4px 0 #140b07,  4px  4px 0 #140b07,
+       0   -4px 0 #140b07,  0    4px 0 #140b07,
+      -4px  0   0 #140b07,  4px  0   0 #140b07,
+       0    9px 0 #6d1410,
+       0   14px 14px rgba(0,0,0,.75);
+  }
+
+  .sub {
+    margin-top: 20px;
+    font-size: 17px;
+    letter-spacing: 3.5px;
+    text-transform: uppercase;
+    color: #c9a87e;
+    text-shadow: 0 2px 0 #140b07, 0 3px 6px rgba(0,0,0,.8);
+  }
+
+  /* The comparison: same tear, sampled twice as often. */
+  .lanes {
+    position: absolute; top: 246px; left: 46px;
+    width: 420px;
+  }
+
+  .lane { position: relative; height: 74px; }
+
+  .lane .label {
+    position: absolute; left: 0; top: 22px;
+    width: 62px;
+    text-align: right;
+    font-size: 25px; font-weight: 700;
+    color: #f2e3c8;
+    text-shadow: -3px -3px 0 #140b07, 3px -3px 0 #140b07,
+                 -3px  3px 0 #140b07, 3px  3px 0 #140b07,
+                  0    2px 0 #140b07;
+  }
+
+  .lane .unit {
+    position: absolute; left: 68px; top: 30px;
+    font-size: 11px; letter-spacing: 2px;
+    color: #8a6f52;
+  }
+
+  .track { position: absolute; left: 108px; top: 0; width: 312px; height: 74px; }
+
+  .caption {
+    position: absolute; bottom: 34px; left: 0; width: 512px;
+    text-align: center;
+    font-size: 14px; letter-spacing: 1.4px;
+    color: #a98a63;
+    text-shadow: 0 2px 0 #140b07;
+  }
+
+  .caption b { color: #d9c09a; font-weight: 700; }
+</style>
+</head>
+<body>
+<div class="room">
+  <div class="grime"></div>
+
+  <svg class="drips" viewBox="0 0 512 130">
+    <!-- Uneven so it reads as spatter rather than a border. -->
+    <path d="M0,0 H512 V26
+             C486,26 480,60 468,60 C456,60 452,26 436,26
+             C412,26 408,74 392,74 C378,74 374,30 352,30
+             C330,30 328,50 314,50 C300,50 296,26 274,26
+             C250,26 246,92 228,92 C212,92 210,32 188,32
+             C166,32 162,58 146,58 C132,58 128,26 104,26
+             C82,26 78,68 62,68 C48,68 44,28 22,28
+             C10,28 6,40 0,40 Z"
+          fill="#5e0f0c"/>
+    <circle cx="392" cy="86" r="5" fill="#5e0f0c"/>
+    <circle cx="228" cy="106" r="6" fill="#5e0f0c"/>
+    <circle cx="62"  cy="80"  r="4" fill="#5e0f0c"/>
+  </svg>
+
+  <div class="title-wrap">
+    <h1>HIGH FPS</h1>
+    <div class="sub">Repentance&nbsp;+</div>
+  </div>
+
+  <div class="lanes">
+    <div class="lane">
+      <div class="label">60</div><div class="unit">FPS</div>
+      <svg class="track" viewBox="0 0 312 74" id="lane-slow"></svg>
+    </div>
+    <div class="lane">
+      <div class="label">180</div><div class="unit">FPS</div>
+      <svg class="track" viewBox="0 0 312 74" id="lane-fast"></svg>
+    </div>
+  </div>
+
+  <div class="caption"></b></div>
+
+  <div class="vignette"></div>
+</div>
+
+<script>
+  // One Isaac tear: pale blue droplet, dark outline, highlight top-left.
+  function tear(x, y, r, alpha) {
+    return `<g transform="translate(${x} ${y})" opacity="${alpha}">
+      <path d="M0,${-r * 1.55} C${r * .95},${-r * .45} ${r},${r * .35} 0,${r}
+               C${-r},${r * .35} ${-r * .95},${-r * .45} 0,${-r * 1.55} Z"
+            fill="#0f1a24" transform="scale(1.34)"/>
+      <path d="M0,${-r * 1.55} C${r * .95},${-r * .45} ${r},${r * .35} 0,${r}
+               C${-r},${r * .35} ${-r * .95},${-r * .45} 0,${-r * 1.55} Z"
+            fill="#9fd8f0"/>
+      <ellipse cx="${-r * .3}" cy="${-r * .35}" rx="${r * .28}" ry="${r * .42}" fill="#eaf9ff"/>
+    </g>`;
+  }
+
+  // Same tear crossing the same distance. The top lane samples it 5 times and you can
+  // count the gaps; the bottom lane samples it 15 times and it reads as motion.
+  const R = 8.5;
+  function lane(id, n) {
+    let out = "";
+    for (let i = 0; i < n; i++) {
+      const t = i / (n - 1);
+      // Fade the trail in so the newest tear reads as the real one.
+      out += tear(14 + t * 284, 37, R, 0.22 + 0.78 * t);
+    }
+    document.getElementById(id).innerHTML = out;
+  }
+  lane("lane-slow", 5);
+  lane("lane-fast", 15);
+</script>
+</body>
+</html>

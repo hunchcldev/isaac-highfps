@@ -24,6 +24,11 @@ Steam\steamapps\common\The Binding of Isaac Rebirth\winmm.dll
 
 That's it. To uninstall, delete the file.
 
+You need a display that runs above 60 Hz, and vsync has to be off or set to your real refresh
+rate. The mod removes the game's own frame limiter but never touches the OpenGL swap interval, so
+with vsync on you stay pinned to whatever the display does. On a 60 Hz panel there is nothing
+above 60 for it to show you.
+
 The game imports `winmm` statically, so Windows loads the mod before the game's own entry point
 runs. Every export of the real `winmm.dll` is forwarded to the system copy, so nothing else in
 the process notices. No injector, no launcher, and nothing asks for elevated permissions.
@@ -38,8 +43,13 @@ download, but the native part gets installed by hand.
 doesn't claim to. All it does is detect whether the native component is running and say so if it
 isn't, which is about the only useful thing Lua can do here.
 
-Detection needs no interprocess machinery. `MC_POST_RENDER` fires once per rendered frame and
-vanilla is hard-capped at 60, so a sustained rate above that means the native part is live.
+Detection reads two globals the native part writes into the Lua state: `HIGH_FPS_NATIVE` holds an
+api version and exists only while it is running, and `HIGH_FPS_RATE` carries the frame rate it
+measured over the last second. Any mod can read them.
+
+It used to detect by counting `MC_POST_RENDER` instead, on the reasoning that a sustained rate
+above 60 was impossible without us. That stopped being true of our own mod once the cadence gate
+landed, see below.
 
 ## Configuration
 
@@ -47,11 +57,44 @@ Optional. Create `isaac-highfps.ini` next to the DLL:
 
 ```ini
 [highfps]
-Enabled     = 1   ; 0 disables the mod without deleting it
-Interpolate = 1   ; 0 = uncap the frame rate but do not add intermediate positions
-MaxFps      = 0   ; 0 = whatever the display allows; otherwise a cap, e.g. 120
-Log         = 1   ; writes %TEMP%\isaac-highfps.log
+Enabled           = 1   ; 0 disables the mod without deleting it
+Interpolate       = 1   ; 0 = uncap the frame rate but do not add intermediate positions
+MaxFps            = 0   ; 0 = whatever the display allows; otherwise a cap, e.g. 120
+LuaVanillaCadence = 1   ; hold the mod render pass at 60 Hz, see Mod compatibility
+LuaOverlay        = 1   ; composite what mods draw onto every frame
+Log               = 1   ; writes %TEMP%\isaac-highfps.log
 ```
+
+The log goes next to the DLL if `%TEMP%` isn't writable. "No log" and "the DLL never loaded" are
+otherwise the same symptom, and that is the most common thing people report.
+
+## Mod compatibility
+
+Uncapping the render loop means the engine asks every installed mod "do you want to draw?" at the
+display rate instead of 60 times a second. That triples the Lua cost of every mod you have, and it
+breaks mods that keep counters or timers in their render callback, which was for a long time the
+only per-frame hook the api offered.
+
+So the mod render pass is held at its original 60 Hz. Every engine call into Lua goes through two
+imported functions, `lua_pcallk` and `lua_callk`, both swapped in the import table. On a frame the
+engine would never have drawn, that pass is not forwarded to Lua at all: the call is emulated
+instead, popping the callee and its arguments off the Lua stack, pushing the requested number of
+nils and returning `LUA_OK`. That is indistinguishable from no mod having registered anything, a
+case every call site already handles.
+
+That alone would mean mod graphics existed on one frame in three, which reads as flicker. So what
+mods draw goes onto a surface of its own, and that surface is composited onto every frame. The
+engine already has the machinery, because it uses render targets for its own bloom, pixelation and
+colormod passes, so nothing here is drawn by us. Mod graphics are present on every frame while
+their Lua still runs 60 times a second.
+
+The per-entity render callbacks are left alone and run at the full rate. They are cheap, and they
+draw relative to entities whose positions we are already interpolating, so running them per frame
+means they track that movement instead of being pinned to 60 Hz.
+
+One consequence worth naming: a mod drawing in both the main pass and a per-entity callback used
+to see them once each per frame and now sees the main pass less often. `LuaVanillaCadence = 0`
+turns the whole thing off and gives every callback the display rate, at the cost above.
 
 ## How it works
 

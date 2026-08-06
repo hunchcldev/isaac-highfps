@@ -14,6 +14,19 @@ Interpolate = 1
 ; The mod drops to 60 on its own during loads and menus regardless of this.
 MaxFps = 0
 
+; Keeps mod Lua callbacks at their normal 60 per second even though the game now renders
+; more frames. Without it, every mod's render callback fires once per rendered frame:
+; three times the Lua cost at 180 fps, and mods that count frames or run logic in render
+; callbacks run three times too fast.
+LuaVanillaCadence = 1
+
+; What mods draw goes onto a surface of its own, which is composited onto every frame.
+; That is what stops mod HUDs from flickering while their Lua stays at 60 Hz. Costs a
+; render target switch per Lua dispatch, so it is the most expensive thing here by far.
+; Turn it off only to test whether it is the cause of a rendering problem; with it off,
+; mod graphics appear on one frame in three.
+LuaOverlay = 1
+
 ; Per-second timings and hitch reports in %TEMP%\isaac-highfps.log.
 ; Leave it on. It's what makes a bug report worth anything.
 Log = 1

@@ -92,6 +92,42 @@ inline constexpr uintptr_t kPreviewHalfOperand[] = {      // [VER] instruction+4
     0x0067989A, 0x00679BE8,  // Tear
 };
 
+// ------------------------------------------------- KAGE graphics / overlay
+// Everything here was read out of THIS binary, mostly by following the engine's own
+// "Colormod Surface" path in sub_6FBC10 — the same sequence we imitate: create a
+// procedural render target, push/bind it, draw, flush, pop, blit it full-screen.
+inline constexpr uintptr_t kGraphicsManager   = 0x00C798E0;  // [VER] +4 == kGWindowFlags
+inline constexpr uintptr_t kScreenWidth       = 0x00C79110;  // [VER] uint32, feeds every surface
+inline constexpr uintptr_t kScreenHeight      = 0x00C79114;  // [VER] uint32
+inline constexpr uintptr_t kOrthoWidth        = 0x00C78DC4;  // [VER] float, full-screen quad
+inline constexpr uintptr_t kOrthoHeight       = 0x00C78EDC;  // [VER] float
+inline constexpr uintptr_t kCurrentShader     = 0x00C379B8;  // [VER] written by kSelectShader
+
+// Manager fields, relative to kGraphicsManager.
+inline constexpr uintptr_t kMgrBlendState     = 0x20;  // [VER] 5 dwords, reset by Clear()
+inline constexpr uintptr_t kMgrCurRenderTgt   = 0x68;  // [VER] == 0x00C79948
+
+// [VER] all four confirmed by disassembly, including their stack cleanup:
+inline constexpr uintptr_t kPushRenderTarget  = 0x00683680;  // no args, retn
+inline constexpr uintptr_t kPopRenderTarget   = 0x006836C0;  // no args, retn ("stack is empty!")
+inline constexpr uintptr_t kSetRenderTarget   = 0x00A18300;  // thiscall(mgr, target, screenSized), retn 8
+inline constexpr uintptr_t kClearTarget       = 0x00A18230;  // thiscall(mgr), clears to (0,0,0,0)
+inline constexpr uintptr_t kFlushBatches      = 0x00A19180;  // thiscall(mgr, 1), retn 4
+inline constexpr uintptr_t kSelectShader      = 0x00A14050;  // stdcall(x) -> KAGE_ColorTextureShader
+inline constexpr uintptr_t kCreateRenderTgt   = 0x00A11F30;  // stdcall(&out, w, h, name, &color), retn 0x14
+
+// ImageBase vtable slots, byte offsets confirmed at the engine's own call sites.
+inline constexpr int kVtImageRender    = 5;   // +0x14  Render(SourceQuad*, DestQuad*, KColor*)
+inline constexpr int kVtImageSetFilter = 18;  // +0x48  SetFilterMode(min, mag)
+inline constexpr uintptr_t kImgFilterCacheMin = 0x38;  // engine mirrors the filter mode here
+inline constexpr uintptr_t kImgFilterCacheMag = 0x3C;
+
+// LuaEngine::PostRender — where mods are given the finished world to draw on, and so the
+// one place in the frame where compositing our own layer is guaranteed to be both legal
+// and correctly ordered. Exactly one caller (0x006FC0A6, inside the render function), and
+// its prologue `55 8B EC 6A FF` is 5 bytes on an instruction boundary.
+inline constexpr uintptr_t kLuaPostRender     = 0x00863680;  // [VER]
+
 // The rollback loop that undoes previews before the authoritative tick.
 // Self-contained; iterates Game+0x125C (array) / +0x1264 (count).
 inline constexpr uintptr_t kRollbackLoopBegin = 0x009551D8;  // [VER]
