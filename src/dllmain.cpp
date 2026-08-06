@@ -1625,6 +1625,14 @@ DWORD WINAPI Init(LPVOID) {
     LoadConfig();
     if (!g_cfg.enabled) return 0;
 
+    // The mod ships under two names so that a loader which will not pick up one of them
+    // can be given the other. Somebody will inevitably install both "to be safe", and two
+    // copies patching the same sites means the second one detours our own trampoline. The
+    // first instance to get here wins; the other returns before touching anything.
+    if (CreateMutexA(nullptr, TRUE, "isaac-highfps-single-instance") == nullptr ||
+        GetLastError() == ERROR_ALREADY_EXISTS)
+        return 0;
+
     if (g_cfg.log) {
         // Wide paths throughout, and a fallback next to the DLL.
         //

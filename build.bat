@@ -20,8 +20,16 @@ call "%VCVARS%" >build\vcvars.log 2>&1
 if errorlevel 1 (echo VCVARS_FAILED - see build\vcvars.log & exit /b 1)
 
 if not exist src\winmm_thunks.cpp (
-    echo generating proxy thunks...
+    echo generating winmm proxy thunks...
     python tools\gen_proxy.py >build\gen.log 2>&1
+    if errorlevel 1 (echo GEN_FAILED & type build\gen.log & exit /b 1)
+)
+rem Same code under a second name, for the handful of setups where the loader never
+rem picks up our winmm. dbghelp is imported by isaac-ng.exe too, is not a KnownDLL,
+rem and nothing else in the process leans on it.
+if not exist src\dbghelp_thunks.cpp (
+    echo generating dbghelp proxy thunks...
+    python tools\gen_proxy.py "%SystemRoot%\SysWOW64\dbghelp.dll" >>build\gen.log 2>&1
     if errorlevel 1 (echo GEN_FAILED & type build\gen.log & exit /b 1)
 )
 
@@ -32,6 +40,13 @@ cl /nologo /std:c++17 /EHsc /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /LD ^
    src\dllmain.cpp src\winmm_thunks.cpp ^
    /link /DEF:src\winmm.def >build\dll.log 2>&1
 if errorlevel 1 (echo CL_DLL_FAILED & type build\dll.log & exit /b 1)
+
+if not exist build\alt mkdir build\alt
+cl /nologo /std:c++17 /EHsc /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /LD ^
+   /Fo:build\alt\ /Fe:build\dbghelp.dll ^
+   src\dllmain.cpp src\dbghelp_thunks.cpp ^
+   /link /DEF:src\dbghelp.def >build\dll_alt.log 2>&1
+if errorlevel 1 (echo CL_ALT_FAILED & type build\dll_alt.log & exit /b 1)
 
 rem Dev-only loader. NOT shipped - it exists so we can iterate without reinstalling.
 cl /nologo /std:c++17 /EHsc /O2 /W3 /D_CRT_SECURE_NO_WARNINGS ^

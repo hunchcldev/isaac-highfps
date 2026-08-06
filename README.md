@@ -33,6 +33,17 @@ The game imports `winmm` statically, so Windows loads the mod before the game's 
 runs. Every export of the real `winmm.dll` is forwarded to the system copy, so nothing else in
 the process notices. No injector, no launcher, and nothing asks for elevated permissions.
 
+### If nothing happens at all
+
+No log file and no change in frame rate means the loader never picked the DLL up. The download
+carries the same build a second time under a different name, in `alternative-name/`. Delete
+`winmm.dll` from the game folder, put `dbghelp.dll` there instead, and try again. The executable
+imports that too, so it loads at the same point in startup.
+
+Use one or the other, never both. They patch the same sites, and two copies doing it means the
+second one detours the first one's trampoline. The DLL takes a single-instance lock so a
+double install does nothing rather than something strange, but there's no reason to rely on it.
+
 This can't ship on the Steam Workshop. The Workshop only accepts Lua content mods, and no Lua
 API reaches the render loop. REPENTOGON has the same problem: a Workshop item can point at the
 download, but the native part gets installed by hand.
