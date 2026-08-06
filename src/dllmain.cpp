@@ -77,13 +77,64 @@ bool Expect(uintptr_t va, const uint8_t* want, size_t n, const char* what) {
     return false;
 }
 
+// Freeze every other thread in the process for the duration of a code write.
+//
+// Without this, Poke overwrites several bytes of a function the game thread is running
+// right now (the update wrapper, the limiter jumps - both in the hot loop). If the CPU is
+// decoding at that address while our memcpy is halfway through, it executes a torn
+// instruction, computes a garbage jump target and lands in unpaged memory. That is a
+// c0000005 in module "unknown" at offset 0, and because it depends on hitting a
+// sub-microsecond window it shows up as "crashes on maybe one launch in ten" on a fast
+// machine and never at all on a slower one. The exact report that led here.
+constexpr int kMaxFrozen = 128;
+HANDLE g_frozen[kMaxFrozen];
+int    g_frozenCount = 0;
+
+void FreezeOtherThreads() {
+    g_frozenCount = 0;
+    const DWORD me  = GetCurrentThreadId();
+    const DWORD pid = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te = { sizeof te };
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
+            HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
+            if (!th) continue;
+            if (SuspendThread(th) == (DWORD)-1) { CloseHandle(th); continue; }
+            // SuspendThread is asynchronous; a register read forces it to have actually
+            // stopped before we touch the code it might be sitting in.
+            CONTEXT ctx; ctx.ContextFlags = CONTEXT_CONTROL;
+            GetThreadContext(th, &ctx);
+            if (g_frozenCount < kMaxFrozen) g_frozen[g_frozenCount++] = th;
+            else { ResumeThread(th); CloseHandle(th); }
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+}
+
+void ThawOtherThreads() {
+    for (int i = 0; i < g_frozenCount; ++i) {
+        ResumeThread(g_frozen[i]);
+        CloseHandle(g_frozen[i]);
+    }
+    g_frozenCount = 0;
+}
+
 bool Poke(uintptr_t va, const uint8_t* bytes, size_t n) {
     uint8_t* p = Addr(va);
     DWORD old = 0;
+    // Page protection is changed BEFORE the freeze on purpose. VirtualProtect can block on
+    // the process VM lock, and if a frozen thread were holding it we would deadlock. The
+    // freeze wraps only the raw write and the icache flush, neither of which needs a lock
+    // a suspended thread could be holding.
     if (!VirtualProtect(p, n, PAGE_EXECUTE_READWRITE, &old)) return false;
+    FreezeOtherThreads();
     memcpy(p, bytes, n);
-    VirtualProtect(p, n, old, &old);
     FlushInstructionCache(GetCurrentProcess(), p, n);
+    ThawOtherThreads();
+    VirtualProtect(p, n, old, &old);
     return true;
 }
 
