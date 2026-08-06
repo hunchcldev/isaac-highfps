@@ -48,19 +48,21 @@ This can't ship on the Steam Workshop. The Workshop only accepts Lua content mod
 API reaches the render loop. REPENTOGON has the same problem: a Workshop item can point at the
 download, but the native part gets installed by hand.
 
-## Workshop companion
+## For mod authors
 
-`workshop/isaac-highfps/` is a small Lua mod for the Workshop. It doesn't speed anything up and
-doesn't claim to. All it does is detect whether the native component is running and say so if it
-isn't, which is about the only useful thing Lua can do here.
+Two globals are published into the Lua state while this is running:
 
-Detection reads two globals the native part writes into the Lua state: `HIGH_FPS_NATIVE` holds an
-api version and exists only while it is running, and `HIGH_FPS_RATE` carries the frame rate it
-measured over the last second. Any mod can read them.
+```lua
+HIGH_FPS_NATIVE  -- api version, absent when the native component isn't there
+HIGH_FPS_RATE    -- frames per second measured over the last second
+```
 
-It used to detect by counting `MC_POST_RENDER` instead, on the reasoning that a sustained rate
-above 60 was impossible without us. That stopped being true of our own mod once the cadence gate
-landed, see below.
+Read them per frame rather than once at load, since they appear on the first dispatch and that
+can land after mods have finished loading.
+
+Counting `MC_POST_RENDER` to work out the frame rate does not work here, and the reason is the
+cadence gate below: that callback is deliberately held at 60 no matter how fast the game renders.
+`HIGH_FPS_RATE` exists because a mod can no longer measure the rate for itself.
 
 ## Configuration
 
