@@ -1,18 +1,22 @@
 # Changelog
 
+## v0.11.1
+
+**The second name is `opengl32`, not `dbghelp`.** A crash handler can leave a real `dbghelp.dll`
+in the game folder, and since the game directory comes before System32 in the search order the
+game is already loading it. Our copy would shadow it and forward only to the system dbghelp, so
+whatever that file did would stop working. `opengl32` in the folder is normally just the loader's
+own from System32, so overwriting it with a forwarding proxy is safe. The fallback lives in
+`alternative-name/opengl32.dll`.
+
 ## v0.11.0
 
 **A second name to load under.** No log file and no change in frame rate means the loader never
 picked the DLL up, and there is nothing the DLL can report about a situation where its own code
-never runs. The download now carries the same build twice, the second copy named `dbghelp.dll`
-in `alternative-name/`. The executable imports that as well, so it loads at the same point in
-startup. Use one or the other, never both; there is a single-instance lock so a double install
-does nothing rather than something strange.
-
-`dbghelp` was picked over the other candidates on purpose. Of everything `isaac-ng.exe` imports,
-most are on Windows' KnownDLLs list and cannot be shadowed from the game folder at all. Of the
-rest, `dbghelp` pulls only five functions, is not tangled up with the graphics stack the way
-`opengl32` is, and is not the sort of file antivirus software takes an interest in.
+never runs. The download carries the same build twice, the second copy in `alternative-name/`.
+The executable imports it as well, so it loads at the same point in startup. Use one or the
+other, never both; there is a single-instance lock so a double install does nothing rather than
+something strange.
 
 **Log paths handle any locale.** They were ANSI, which fails silently when a profile or install
 path holds characters the system codepage cannot carry. A failed open left logging switched off

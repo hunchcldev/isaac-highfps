@@ -4,8 +4,8 @@ release/
 # Generated from the system winmm.dll by tools/gen_proxy.py; build.bat recreates them.
 src/winmm_thunks.cpp
 src/winmm.def
-src/dbghelp_thunks.cpp
-src/dbghelp.def
+src/opengl32_thunks.cpp
+src/opengl32.def
 
 *.obj
 *.exp

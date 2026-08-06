@@ -37,7 +37,7 @@ the process notices. No injector, no launcher, and nothing asks for elevated per
 
 No log file and no change in frame rate means the loader never picked the DLL up. The download
 carries the same build a second time under a different name, in `alternative-name/`. Delete
-`winmm.dll` from the game folder, put `dbghelp.dll` there instead, and try again. The executable
+`winmm.dll` from the game folder, put `opengl32.dll` there instead, and try again. The executable
 imports that too, so it loads at the same point in startup.
 
 Use one or the other, never both. They patch the same sites, and two copies doing it means the

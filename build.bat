@@ -25,11 +25,13 @@ if not exist src\winmm_thunks.cpp (
     if errorlevel 1 (echo GEN_FAILED & type build\gen.log & exit /b 1)
 )
 rem Same code under a second name, for the handful of setups where the loader never
-rem picks up our winmm. dbghelp is imported by isaac-ng.exe too, is not a KnownDLL,
-rem and nothing else in the process leans on it.
-if not exist src\dbghelp_thunks.cpp (
-    echo generating dbghelp proxy thunks...
-    python tools\gen_proxy.py "%SystemRoot%\SysWOW64\dbghelp.dll" >>build\gen.log 2>&1
+rem picks up our winmm. opengl32 is imported by isaac-ng.exe too and is not a KnownDLL.
+rem dbghelp was the first pick and got dropped: a crash handler can leave a real
+rem dbghelp.dll in the game folder, and ours would shadow it. opengl32 in the folder is
+rem normally just the loader's own from System32, so overwriting it is safe.
+if not exist src\opengl32_thunks.cpp (
+    echo generating opengl32 proxy thunks...
+    python tools\gen_proxy.py "%SystemRoot%\SysWOW64\opengl32.dll" >>build\gen.log 2>&1
     if errorlevel 1 (echo GEN_FAILED & type build\gen.log & exit /b 1)
 )
 
@@ -43,9 +45,9 @@ if errorlevel 1 (echo CL_DLL_FAILED & type build\dll.log & exit /b 1)
 
 if not exist build\alt mkdir build\alt
 cl /nologo /std:c++17 /EHsc /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /LD ^
-   /Fo:build\alt\ /Fe:build\dbghelp.dll ^
-   src\dllmain.cpp src\dbghelp_thunks.cpp ^
-   /link /DEF:src\dbghelp.def >build\dll_alt.log 2>&1
+   /Fo:build\alt\ /Fe:build\opengl32.dll ^
+   src\dllmain.cpp src\opengl32_thunks.cpp ^
+   /link /DEF:src\opengl32.def >build\dll_alt.log 2>&1
 if errorlevel 1 (echo CL_ALT_FAILED & type build\dll_alt.log & exit /b 1)
 
 rem Dev-only loader. NOT shipped - it exists so we can iterate without reinstalling.
