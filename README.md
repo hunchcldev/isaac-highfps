@@ -44,6 +44,26 @@ Use one or the other, never both. They patch the same sites, and two copies doin
 second one detours the first one's trampoline. The DLL takes a single-instance lock so a
 double install does nothing rather than something strange, but there's no reason to rely on it.
 
+### Steam Deck and Linux
+
+Works under Proton, with one extra step. Wine ships its own `winmm`, and for system DLLs like
+that it prefers its built-in copy over the one in the game folder, so ours never loads. Force it
+with a launch option (Properties, then paste into Launch Options):
+
+```
+WINEDLLOVERRIDES="winmm=n,b" %command%
+```
+
+`n,b` means native first, built-in second: Wine loads our `winmm.dll` and falls back to its own
+if ours is missing. The forwarding still works, it just points at Wine's built-in winmm instead
+of a real system one.
+
+Two Deck-specific notes. The internal LCD is 60 Hz, so the mod has nothing to show there; the
+OLED at 90 Hz or an external high-refresh screen is where it helps. And the Deck isn't a strong
+machine, so a busy room may not hold the higher rate. If it crashes rather than just doing
+nothing, set `LuaOverlay = 0`, same as on Windows: the overlay does real GL work through Proton's
+translation layer and that's where the risk is.
+
 This can't ship on the Steam Workshop. The Workshop only accepts Lua content mods, and no Lua
 API reaches the render loop. REPENTOGON has the same problem: a Workshop item can point at the
 download, but the native part gets installed by hand.
