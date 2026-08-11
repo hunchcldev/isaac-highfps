@@ -44,6 +44,7 @@ struct Config {
     bool cacheFileProbes = true;
     bool luaVanillaCadence = true;   // pin mod callbacks to the vanilla 60 Hz
     bool luaOverlay = true;          // and composite what they draw onto every frame
+    bool subpixelSprites = true;     // neutralise the renderer's RT-pixel snapping
 } g_cfg;
 
 void LoadConfig() {
@@ -62,6 +63,7 @@ void LoadConfig() {
     g_cfg.cacheFileProbes = GetPrivateProfileIntA("highfps", "CacheFileProbes", 1, path) != 0;
     g_cfg.luaVanillaCadence = GetPrivateProfileIntA("highfps", "LuaVanillaCadence", 1, path) != 0;
     g_cfg.luaOverlay        = GetPrivateProfileIntA("highfps", "LuaOverlay", 1, path) != 0;
+    g_cfg.subpixelSprites   = GetPrivateProfileIntA("highfps", "SubpixelSprites", 1, path) != 0;
 }
 
 inline uint8_t* Addr(uintptr_t staticVa) {
@@ -185,6 +187,7 @@ volatile LONG g_probeHits = 0, g_probeMisses = 0;
 volatile LONG g_inRenderPhase = 0;
 volatile LONG g_inModRenderPass = 0;   // set while LuaEngine::PostRender is on the stack
 volatile LONG g_pushRate = 0;          // last measured fps, handed to Lua for the companion
+void RearmLuaGateIfRepointed();        // defined with the gate below, checked per second
 LONG g_overlayScopes = 0, g_overlayBlits = 0;
 bool g_overlayFailed = false;
 void PrepareOverlay();
@@ -211,14 +214,14 @@ WrapperFn g_wrapperTrampoline = nullptr;
 // 0.5 * TimeScale * Friction * Velocity and marking the entity so the next logic tick can
 // roll it back. We reuse that storage and that marker, but compute the step ourselves for
 // an arbitrary fraction of the tick.
-uintptr_t GameObj() { return *reinterpret_cast<uintptr_t*>(Addr(0x00C71678)); }
+uintptr_t GameObj() { return *reinterpret_cast<uintptr_t*>(Addr(isaac::kGameObjPtr)); }
 
 // The gameplay clock, distinct from the render frame counter: it only advances inside
 // the full 30 Hz logic pass, so it stands still on the pause menu, during room
 // transitions and in cutscenes.
 uint32_t GameFrame() {
     uintptr_t game = GameObj();
-    return game >= 0x10000 ? *reinterpret_cast<uint32_t*>(game + 0x264F8) : 0;
+    return game >= 0x10000 ? *reinterpret_cast<uint32_t*>(game + isaac::kGameTick) : 0;
 }
 
 // Game+0x18300 -> the active entity list; +0x125C is Entity*[], +0x1264 the count.
@@ -349,8 +352,15 @@ inline float MapToScreen(int axis, float world) {
          + (ortho - (axis ? 182.0f : 338.0f)) * 0.5f;
 }
 
+// True once the renderer's snapping has been patched out (see InstallSubpixel): the
+// drawn position then IS the smooth position, and everything modelling the snap has to
+// switch off with it or it would reintroduce the very sawtooth it used to cancel.
+bool g_subpixelActive = false;
+
 // RT pixels per screen unit, or 0 while the graphics are not up / values are implausible.
+// Also 0 when the snapping is patched out - callers use s == 0 as "do not model a snap".
 inline float SnapScale() {
+    if (g_subpixelActive) return 0.0f;
     const float s = *reinterpret_cast<float*>(Addr(isaac::kSnapScaleA))
                   * *reinterpret_cast<float*>(Addr(isaac::kSnapScaleB));
     return (s > 0.01f && s < 1024.0f) ? s : 0.0f;
@@ -816,6 +826,10 @@ int __cdecl HookedUpdateWrapper() {
         // because the callback they would count is exactly the one we pin to 60.
         g_pushRate = LONG(g_loopFrames);
 
+        // Somebody else may have re-pointed the Lua import slots since we hooked them -
+        // REPENTOGON's Lua 5.4 redirect rewrites exactly the entries we hold.
+        RearmLuaGateIfRepointed();
+
         g_loopFrames = g_wrapperCalls = 0;
         g_prof = Profile{};
         g_statWindow = now;
@@ -971,7 +985,9 @@ int __cdecl HookedUpdateWrapper() {
     return result;
 }
 
-bool InstallWrapperHook() {
+// --- 1.9.7.17: the update wrapper is its own function, called once by main; a clean
+// 5-byte push prologue makes it a straightforward prologue detour. ---
+bool InstallWrapperHook17() {
     // The prologue is `68 10 C5 C5 00` = push offset off_C5C510. That operand is an
     // absolute address, so the loader rebases it: comparing against the on-disk bytes
     // fails by exactly the ASLR delta. Check the opcode and the *relocated* operand.
@@ -1001,6 +1017,69 @@ bool InstallWrapperHook() {
     return Poke(isaac::kManagerUpdateWrp, patch, sizeof patch);
 }
 
+// --- 1.9.7.12 (REPENTOGON): there is NO separate wrapper. main inlines the two calls the
+// 17 wrapper made - the pre-step and the phase machine - as one block:
+//   0x90AEFF  32 C9              xor cl,cl
+//   0x90AF01  E8 <rel>           call pre-step   (0xA2AC40, SEH-framed, reads cl)
+//   0x90AF06  6A 01              push 1
+//   0x90AF08  E8 <rel>           call Manager::Update  (0x92E3E0, the phase machine)
+//   0x90AF0D  E8 <rel>           call Manager::Render  (stays)
+// So the equivalent hook is a call-block patch: replace the 14-byte pre-step+update block
+// with a single call into HookedUpdateWrapper, whose trampoline replays exactly those 14
+// bytes (with the two relative calls relocated) and returns. Same semantics as the 17
+// wrapper trampoline - one call = pre-step + one phase-machine tick - so HookedUpdateWrapper
+// itself is unchanged. The block already zeroes cl itself, so no calling-convention shim.
+bool InstallWrapperHook12() {
+    constexpr uintptr_t kBlock = 0x0090AEFF;
+    constexpr size_t    kBlockLen = 14;
+    uint8_t* site = Addr(kBlock);
+
+    // Shape guard: the two rel32 operands vary with ASLR, so verify the fixed bytes and
+    // that both relocated call targets are where we expect.
+    const uintptr_t preStep = reinterpret_cast<uintptr_t>(site + 2) + 5
+                            + *reinterpret_cast<int32_t*>(site + 3);
+    const uintptr_t phase   = reinterpret_cast<uintptr_t>(site + 9) + 5
+                            + *reinterpret_cast<int32_t*>(site + 10);
+    const uintptr_t wantPre   = reinterpret_cast<uintptr_t>(Addr(0x00A2AC40));
+    const uintptr_t wantPhase = reinterpret_cast<uintptr_t>(Addr(0x0092E3E0));
+    if (site[0] != 0x32 || site[1] != 0xC9 || site[2] != 0xE8 ||
+        site[7] != 0x6A || site[8] != 0x01 || site[9] != 0xE8 ||
+        preStep != wantPre || phase != wantPhase) {
+        Log("[FATAL] 12 update block @ 0x%08X: %02X %02X %02X..%02X %02X %02X, pre=0x%08X"
+            " phase=0x%08X - wrong game build?", (unsigned)kBlock,
+            site[0], site[1], site[2], site[7], site[8], site[9],
+            (unsigned)preStep, (unsigned)phase);
+        return false;
+    }
+
+    uint8_t* tramp = static_cast<uint8_t*>(
+        VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!tramp) return false;
+
+    // Copy the live (relocated) block, re-base its two E8 displacements to the trampoline,
+    // then append a ret so it behaves as a callable subroutine.
+    memcpy(tramp, site, kBlockLen);
+    *reinterpret_cast<int32_t*>(tramp + 3) =
+        static_cast<int32_t>(preStep - (reinterpret_cast<uintptr_t>(tramp + 2) + 5));
+    *reinterpret_cast<int32_t*>(tramp + 10) =
+        static_cast<int32_t>(phase - (reinterpret_cast<uintptr_t>(tramp + 9) + 5));
+    tramp[kBlockLen] = 0xC3;
+    g_wrapperTrampoline = reinterpret_cast<WrapperFn>(tramp);
+
+    // Patch: E8 call HookedUpdateWrapper (returns into main, which continues with Render),
+    // then NOP out the rest of the block.
+    uint8_t patch[kBlockLen];
+    patch[0] = 0xE8;
+    *reinterpret_cast<int32_t*>(patch + 1) = static_cast<int32_t>(
+        reinterpret_cast<uintptr_t>(&HookedUpdateWrapper) - (reinterpret_cast<uintptr_t>(site) + 5));
+    memset(patch + 5, 0x90, kBlockLen - 5);
+    return Poke(kBlock, patch, sizeof patch);
+}
+
+bool InstallWrapperHook() {
+    return isaac::g_isRepentogon ? InstallWrapperHook12() : InstallWrapperHook17();
+}
+
 // ------------------------------------------------------------- limiter
 // 0x93134D  84 DB              test bl,bl          ; forceLimiterFlag
 // 0x93134F  75 10              jnz  0x931361       ; -> Sleep + spin
@@ -1010,7 +1089,7 @@ bool InstallWrapperHook() {
 // Neutralising the flag test and making the second jump unconditional takes the
 // "no pacing" path every iteration. The window-should-close check sits *before*
 // this block, so the game still exits cleanly.
-bool RemoveFrameLimiter() {
+bool RemoveFrameLimiter17() {
     static const uint8_t kFlagTest[] = {0x84, 0xDB, 0x75, 0x10};
     static const uint8_t kVsyncJnz[] = {0x0F, 0x85, 0xD0, 0xFE, 0xFF, 0xFF};
     if (!Expect(0x0093134D, kFlagTest, sizeof kFlagTest, "limiter flag test")) return false;
@@ -1022,6 +1101,127 @@ bool RemoveFrameLimiter() {
     // jmp 0x931231 : rel32 = 0x931231 - (0x93135B + 5) = -0x12F
     static const uint8_t kJmpLoopHead[] = {0xE9, 0xD1, 0xFE, 0xFF, 0xFF, 0x90};
     return Poke(0x0093135B, kJmpLoopHead, sizeof kJmpLoopHead);
+}
+
+// 1.9.7.12 pacing is a different shape - no vsync flag test in main. After the render the
+// loop computes a sleep count (ms until the next 1/60 boundary), sleeps it, then busy-spins
+// until enough time has passed:
+//   0x90AF88  33 C9              xor ecx,ecx
+//   0x90AF8A  85 C0              test eax,eax
+//   0x90AF8C  0F 4F C8          cmovg ecx,eax      ; ecx = max(0, sleepTicks)
+//   ...       push ecx / call Sleep               ; skipped when ecx==0
+//   0x90B015  66 0F 2F C8        comisd xmm1,xmm0
+//   0x90B019  77 E5             ja 0x90B000        ; spin back until 1/60 elapsed
+//   0x90B01B  E9 ..             jmp loop head
+// Free-running = never sleep, never spin. NOP the cmovg so the clamped sleep count stays 0
+// (the je below then skips the Sleep block), and NOP the spin's back-branch so control
+// falls straight through to the loop head. All timing bookkeeping is left intact.
+bool RemoveFrameLimiter12() {
+    static const uint8_t kCmovg[] = {0x0F, 0x4F, 0xC8};   // cmovg ecx,eax
+    static const uint8_t kSpinJa[] = {0x77, 0xE5};        // ja 0x90B000
+    if (!Expect(0x0090AF8C, kCmovg, sizeof kCmovg, "12 limiter sleep-clamp")) return false;
+    if (!Expect(0x0090B019, kSpinJa, sizeof kSpinJa, "12 limiter spin branch")) return false;
+
+    static const uint8_t kNop3[] = {0x90, 0x90, 0x90};
+    static const uint8_t kNop2[] = {0x90, 0x90};
+    if (!Poke(0x0090AF8C, kNop3, sizeof kNop3)) return false;
+    return Poke(0x0090B019, kNop2, sizeof kNop2);
+}
+
+bool RemoveFrameLimiter() {
+    return isaac::g_isRepentogon ? RemoveFrameLimiter12() : RemoveFrameLimiter17();
+}
+
+// ------------------------------------------------------- subpixel sprites
+// The renderer rounds every sprite's position term to the render-target pixel grid
+// before the scroll offset is added:  floor(screen * s + 0.5) / s  with s = the render
+// scale. On a 60 Hz cadence that quantisation is invisible - everything steps together.
+// Against OUR smoothly scrolling background it is not: any moving entity steps whole RT
+// pixels while the world glides past it, which reads as the same shiver the player had.
+// The player could be cured by phase-locking the scroll to HIS staircase, but there is
+// one scroll and many staircases - for everyone else the rounding itself has to go.
+//
+// Every rounding site compiles to the same idiom: addss with the shared 0.5 constant,
+// a float->double spill (fld/fstp), then a direct call to the CRT floor. The sites are
+// found at runtime by that shape - a call to floor preceded by `fstp [esp]`, with the
+// 0.5-addss AND a render-scale constant in the preceding bytes. The context matters:
+// plain round-to-nearest floor(x+0.5) exists in gameplay code too and must keep
+// flooring. Each found call is retargeted to a thunk returning x - 0.5, which together
+// with the addss already executed is the exact identity: the quad lands at its true
+// sub-pixel position and the GPU rasterises it there. Sprite texel seams already sit at
+// non-integer positions in vanilla (the world-to-screen scale is 0.65), so fractional
+// placement adds no artifact class that vanilla does not have.
+static const double g_snapHalf = 0.5;
+
+constexpr int kMaxSnapSites = 512;   // the scan finds ~193; headroom, never trust exact
+uintptr_t g_snapSites[kMaxSnapSites];
+
+__declspec(naked) void SnapIdentityFloor() {
+    __asm {
+        fld   qword ptr [esp + 4]
+        fsub  qword ptr [g_snapHalf]
+        ret
+    }
+}
+
+int InstallSubpixel() {
+    const uintptr_t floorVa = reinterpret_cast<uintptr_t>(Addr(isaac::kCrtFloor));
+    const uint32_t halfC  = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Addr(isaac::kConstHalfShared)));
+    const uint32_t p65C   = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Addr(isaac::kConst065)));
+    const uint32_t scaleA = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Addr(isaac::kSnapScaleA)));
+    const uint32_t scaleB = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Addr(isaac::kSnapScaleB)));
+
+    // Sanity before trusting the shape scan at all: both constants must hold their
+    // documented values in this build, or the idiom we scan for is not the idiom.
+    if (*reinterpret_cast<float*>(Addr(isaac::kConstHalfShared)) != 0.5f ||
+        *reinterpret_cast<float*>(Addr(isaac::kConst065)) < 0.649f ||
+        *reinterpret_cast<float*>(Addr(isaac::kConst065)) > 0.651f) {
+        Log("[subpixel] shared constants do not match - wrong build? not patching");
+        return 0;
+    }
+
+    constexpr uintptr_t kTextBegin = 0x00401000, kTextEnd = 0x00AF0000;
+    const uint8_t* text = Addr(kTextBegin);
+    const size_t len = kTextEnd - kTextBegin;
+    int patched = 0;
+
+    for (size_t i = 0x50; i + 5 <= len; ++i) {
+        if (text[i] != 0xE8) continue;
+        const uintptr_t site = reinterpret_cast<uintptr_t>(text) + i;
+        if (site + 5 + *reinterpret_cast<const int32_t*>(text + i + 1) != floorVa) continue;
+        // fstp qword [esp] - the float->double argument push every site ends with
+        if (memcmp(text + i - 3, "\xDD\x1C\x24", 3) != 0) continue;
+
+        const uint8_t* w = text + i - 0x50;
+        bool hasHalf = false, hasRender = false;
+        for (int j = 0; j + 8 <= 0x50 && !hasHalf; ++j)   // addss xmm?, [0.5]
+            if (w[j] == 0xF3 && w[j + 1] == 0x0F && w[j + 2] == 0x58 &&
+                (w[j + 3] & 0xC7) == 0x05 &&
+                *reinterpret_cast<const uint32_t*>(w + j + 4) == halfC) hasHalf = true;
+        for (int j = 0; j + 4 <= 0x50 && !hasRender; ++j) {
+            const uint32_t v = *reinterpret_cast<const uint32_t*>(w + j);
+            if (v == p65C || v == scaleA || v == scaleB) hasRender = true;
+        }
+        if (!hasHalf || !hasRender) continue;
+        if (patched < kMaxSnapSites) g_snapSites[patched++] = site;
+    }
+    if (!patched) return 0;
+
+    // One freeze for all of them, not one per site: Poke's per-call freeze costs
+    // milliseconds each, and two hundred of those is a visible startup stall. Same
+    // ordering rule as Poke - protection changes strictly outside the freeze.
+    DWORD old = 0;
+    uint8_t* base = Addr(kTextBegin);
+    if (!VirtualProtect(base, len, PAGE_EXECUTE_READWRITE, &old)) return 0;
+    FreezeOtherThreads();
+    for (int k = 0; k < patched; ++k) {
+        *reinterpret_cast<int32_t*>(g_snapSites[k] + 1) = static_cast<int32_t>(
+            reinterpret_cast<uintptr_t>(&SnapIdentityFloor) - (g_snapSites[k] + 5));
+    }
+    FlushInstructionCache(GetCurrentProcess(), base, len);
+    ThawOtherThreads();
+    VirtualProtect(base, len, old, &old);
+    return patched;
 }
 
 // ------------------------------------------------ file probe cache
@@ -1277,6 +1477,34 @@ int __cdecl HookedAccess(const char* path, int mode) {
         }
     }
     return result;
+}
+
+// Read the current value of one import slot without touching it. What sits in the slot
+// is the only truth about where a call through it goes: REPENTOGON, for one, rewrites
+// the game's whole Lua import table to point at its own Lua 5.4, and resolving the
+// "real" function from the original DLL's export table would then hand us a function
+// of the wrong Lua runtime.
+void* ReadImport(const char* dllName, const char* funcName) {
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(g_base);
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(g_base + dos->e_lfanew);
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return nullptr;
+
+    auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(g_base + dir.VirtualAddress);
+    for (; desc->Name; ++desc) {
+        const char* mod = reinterpret_cast<const char*>(g_base + desc->Name);
+        if (_stricmp(mod, dllName) != 0) continue;
+        auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA32*>(
+            g_base + (desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk));
+        auto* iat = reinterpret_cast<IMAGE_THUNK_DATA32*>(g_base + desc->FirstThunk);
+        for (; thunk->u1.AddressOfData; ++thunk, ++iat) {
+            if (thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG32) continue;
+            auto* byName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(g_base + thunk->u1.AddressOfData);
+            if (strcmp(byName->Name, funcName) == 0)
+                return reinterpret_cast<void*>(iat->u1.Function);
+        }
+    }
+    return nullptr;
 }
 
 // Swap one entry in the import table. Returns the original.
@@ -1892,26 +2120,58 @@ void __cdecl HookedCallk(void* L, int nargs, int nresults, intptr_t ctx, void* k
     g_realCallk(L, nargs, nresults, ctx, k);
 }
 
-bool InstallLuaGate() {
-    HMODULE lua = GetModuleHandleA("Lua5.3.3r.dll");
-    if (!lua) return false;
-    g_luaGettop  = reinterpret_cast<LuaGettopFn >(GetProcAddress(lua, "lua_gettop"));
-    g_luaSettop  = reinterpret_cast<LuaSettopFn >(GetProcAddress(lua, "lua_settop"));
-    g_luaPushnil = reinterpret_cast<LuaPushnilFn>(GetProcAddress(lua, "lua_pushnil"));
-    if (!g_luaGettop || !g_luaSettop || !g_luaPushnil) return false;
+// Take the game's Lua runtime as it is wired RIGHT NOW. The import slots are the truth,
+// not the Lua5.3.3r.dll export table: REPENTOGON re-points the game's entire Lua import
+// table at its own Lua 5.4, and a "real" function resolved from the 5.3 DLL would then
+// run 5.3 code against a 5.4 state. So the forward targets come out of the slots, and
+// every helper we call ourselves comes from whichever module those slots point into.
+bool AdoptLuaRuntime() {
+    void* pc = ReadImport("Lua5.3.3r.dll", "lua_pcallk");
+    void* ck = ReadImport("Lua5.3.3r.dll", "lua_callk");
+    if (!pc || !ck) return false;
+    if (pc == reinterpret_cast<void*>(&HookedPcallk) ||
+        ck == reinterpret_cast<void*>(&HookedCallk))
+        return true;   // the slots are already ours; nothing changed
+
+    HMODULE rt = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            static_cast<LPCSTR>(pc), &rt) || !rt)
+        return false;
+
+    auto* gettop  = reinterpret_cast<LuaGettopFn >(GetProcAddress(rt, "lua_gettop"));
+    auto* settop  = reinterpret_cast<LuaSettopFn >(GetProcAddress(rt, "lua_settop"));
+    auto* pushnil = reinterpret_cast<LuaPushnilFn>(GetProcAddress(rt, "lua_pushnil"));
+    if (!gettop || !settop || !pushnil) return false;
+
+    g_luaGettop  = gettop;
+    g_luaSettop  = settop;
+    g_luaPushnil = pushnil;
     // Optional: without these the gate still works, mods just cannot see that we are here.
-    g_luaPushInt   = reinterpret_cast<LuaPushIntFn  >(GetProcAddress(lua, "lua_pushinteger"));
-    g_luaPushStr   = reinterpret_cast<LuaPushStrFn  >(GetProcAddress(lua, "lua_pushstring"));
-    g_luaSetGlobal = reinterpret_cast<LuaSetGlobalFn>(GetProcAddress(lua, "lua_setglobal"));
+    g_luaPushInt   = reinterpret_cast<LuaPushIntFn  >(GetProcAddress(rt, "lua_pushinteger"));
+    g_luaPushStr   = reinterpret_cast<LuaPushStrFn  >(GetProcAddress(rt, "lua_pushstring"));
+    g_luaSetGlobal = reinterpret_cast<LuaSetGlobalFn>(GetProcAddress(rt, "lua_setglobal"));
     if (!g_luaPushInt || !g_luaSetGlobal)
         Log("[warn] lua_pushinteger/lua_setglobal missing - mods cannot detect the native part");
 
-    // Same ordering rule as the file cache above: resolve the real functions from the export
-    // table BEFORE swapping the import slots, so a lua_pcallk/lua_callk that lands the instant
-    // a slot changes goes to the real function, never through a null pointer.
-    g_realPcallk = reinterpret_cast<LuaPcallkFn>(GetProcAddress(lua, "lua_pcallk"));
-    g_realCallk  = reinterpret_cast<LuaCallkFn >(GetProcAddress(lua, "lua_callk"));
-    if (!g_realPcallk || !g_realCallk) { g_realPcallk = nullptr; g_realCallk = nullptr; return false; }
+    // Assigned last, exactly like the file cache: the hooks forward through these on
+    // their first line, so they must never be observable half-set.
+    g_realPcallk = reinterpret_cast<LuaPcallkFn>(pc);
+    g_realCallk  = reinterpret_cast<LuaCallkFn >(ck);
+    g_lastLuaState = nullptr;   // republish presence into whatever state dispatches next
+
+    char mod[MAX_PATH] = "?";
+    GetModuleFileNameA(rt, mod, MAX_PATH);
+    const char* base = strrchr(mod, '\\');
+    Log("[lua] runtime adopted from import table: %s", base ? base + 1 : mod);
+    return true;
+}
+
+bool InstallLuaGate() {
+    // The game we know imports its Lua through this name; if that changes, every
+    // assumption below is up for review, so refuse rather than guess.
+    if (!GetModuleHandleA("Lua5.3.3r.dll")) return false;
+    if (!AdoptLuaRuntime()) return false;
 
     if (!HookImport("Lua5.3.3r.dll", "lua_pcallk", reinterpret_cast<void*>(&HookedPcallk)))
         return false;
@@ -1921,6 +2181,22 @@ bool InstallLuaGate() {
         return false;
     }
     return true;
+}
+
+// Called once a second from the frame loop. REPENTOGON's loader rewrites the same import
+// slots we hold - whichever of us runs last wins - and its injection time is not ours to
+// control. If the slots stopped pointing at us, adopt whatever runtime they point at now
+// and put the gate back on top. Costs two import-table walks per second when idle.
+void RearmLuaGateIfRepointed() {
+    if (!g_realPcallk) return;   // gate never installed; nothing to guard
+    void* slot = ReadImport("Lua5.3.3r.dll", "lua_pcallk");
+    if (!slot || slot == reinterpret_cast<void*>(&HookedPcallk)) return;
+    if (AdoptLuaRuntime() &&
+        HookImport("Lua5.3.3r.dll", "lua_pcallk", reinterpret_cast<void*>(&HookedPcallk)) &&
+        HookImport("Lua5.3.3r.dll", "lua_callk",  reinterpret_cast<void*>(&HookedCallk)))
+        Log("[lua] import table was re-pointed after install (REPENTOGON?) - gate re-armed");
+    else
+        Log("[warn] lua import table re-pointed and re-adoption failed - gate is off");
 }
 
 DWORD WINAPI Init(LPVOID) {
@@ -1962,8 +2238,31 @@ DWORD WINAPI Init(LPVOID) {
     g_qpcToSeconds = 1.0 / double(f.QuadPart);
     QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&g_qpcStart));
 
+    // Which build loaded us? The PE header is not encrypted (only .text is, and by a stub
+    // that has not run yet), so the TimeDateStamp is readable now and selects the address
+    // set for everything below. Do this BEFORE the g_Manager wait - that read already uses
+    // a build-specific address.
+    const uint32_t peOff = *reinterpret_cast<uint32_t*>(g_base + 0x3C);
+    const uint32_t tds   = *reinterpret_cast<uint32_t*>(g_base + peOff + 8);
+    isaac::SelectBuild(tds);
+
+    char host[MAX_PATH] = {0};
+    GetModuleFileNameA(nullptr, host, MAX_PATH);
     Log("isaac-highfps: module base 0x%08X (ASLR delta 0x%08X)",
         (unsigned)g_base, (unsigned)(g_base - isaac::kImageBase));
+    Log("host exe = %s", host);
+    Log("build = %s (PE TimeDateStamp 0x%08X)",
+        isaac::g_isRepentogon ? "1.9.7.12 / REPENTOGON" :
+        (tds == isaac::kTimeDateStamp_1_9_7_17 ? "1.9.7.17 / Steam" : "UNKNOWN - using 1.9.7.17 offsets"),
+        tds);
+
+    // The overlay compositor's KAGE render path is not ported to 1.9.7.12 (Clear/Flush/
+    // shader select were refactored there), so keep it off on that build. High-FPS, smooth
+    // motion and subpixel sprites are unaffected; mod HUDs update at 60 Hz instead.
+    if (isaac::g_isRepentogon && g_cfg.luaOverlay) {
+        g_cfg.luaOverlay = false;
+        Log("[note] lua overlay not supported on 1.9.7.12 - disabled; mod graphics run at 60 Hz");
+    }
 
     // We are loaded as a static import, so DllMain runs before the executable's own
     // entry point — and that entry point is the Steam DRM stub in .bind, which is what
@@ -1994,6 +2293,17 @@ DWORD WINAPI Init(LPVOID) {
 
     if (!RemoveFrameLimiter()) { Log("limiter patch FAILED - hook is live, game stays at 60"); return 0; }
     Log("limiter removed - render loop now free-running");
+
+    if (g_cfg.subpixelSprites) {
+        const int n = InstallSubpixel();
+        g_subpixelActive = n > 0;
+        if (n > 0)
+            Log("subpixel sprites: %d snap sites neutralised - drawn positions are now "
+                "continuous, snap-aware camera lock off", n);
+        else
+            Log("[warn] subpixel scan found no snap sites - RT-pixel snapping stays, "
+                "snap-aware camera lock stays on");
+    }
 
     if (g_cfg.profile) {
         CreateThread(nullptr, 0, SamplerThread, nullptr, 0, nullptr);

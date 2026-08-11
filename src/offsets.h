@@ -15,19 +15,42 @@ namespace isaac {
 
 inline constexpr uintptr_t kImageBase = 0x00400000;
 
+// ------------------------------------------------------------ build select
+// The game ships as two diverging x86 builds we support with ONE dll: the main-folder
+// Steam build (v1.9.7.17, "J460") and the REPENTOGON build in the Repentogon\ subfolder
+// (v1.9.7.12, "J293"). They are different compilations - every image address moved, three
+// Manager members shifted, and the frame limiter + update wrapper have a different SHAPE
+// (see RemoveFrameLimiter / InstallWrapperHook). Struct member offsets are identical.
+//
+// Detection is the PE TimeDateStamp read from the host exe's in-memory header. The header
+// is NOT encrypted (only .text is, by the Steam DRM stub that runs after us), so this is
+// safe to read at init before anything else - unlike a .text byte probe. It is also
+// rename-proof, unlike keying on the "Repentogon" folder name.
+enum Build { kBuild_1_9_7_17 = 0, kBuild_1_9_7_12 = 1 };
+inline Build g_build = kBuild_1_9_7_17;
+inline bool  g_isRepentogon = false;
+constexpr uint32_t kTimeDateStamp_1_9_7_17 = 0x69E6E3A7;
+constexpr uint32_t kTimeDateStamp_1_9_7_12 = 0x68154D8D;
+
+// Addresses that MOVE between builds are mutable globals, seeded with the 1.9.7.17 values
+// and overwritten by SelectBuild() for 1.9.7.12. Use sites are unchanged - they were
+// `isaac::kX` before and still are; they are just no longer compile-time constants.
+
 // ---------------------------------------------------------------- globals
 // g_Manager: the global Manager*. [SIG] captured from the g_Manager ZHL pattern,
 // [LIVE] dereferenced in the running game and all member offsets below read back sane.
-inline constexpr uintptr_t kGManagerPtr   = 0x00C7169C;
-inline constexpr uintptr_t kGMenuManager  = 0x00C72A20;  // [SIG]
-inline constexpr uintptr_t kGWindowFlags  = 0x00C798E4;  // [VER] bit 0x200 = vsync enabled
+inline uintptr_t kGManagerPtr   = 0x00C7169C;
+inline uintptr_t kGameObjPtr    = 0x00C71678;  // g_Game; was hardcoded in dllmain
+inline uintptr_t kGameTick      = 0x000264F8;  // Game + this = 30 Hz gameplay clock
+inline constexpr uintptr_t kGMenuManager  = 0x00C72A20;  // [SIG] unused by code
+inline uintptr_t kGWindowFlags  = 0x00C798E4;  // [VER] bit 0x200 = vsync enabled
 
 // ------------------------------------------------------- Manager members
 // Offsets from *g_Manager. Note REPENTOGON publishes 0x4A8B8 for _framecount and
 // 0x2A1FB for _enableInterpolation on their 1.9.7.12 build — both differ from ours,
 // so these were derived against THIS binary, not ported.
-inline constexpr uintptr_t kMgrFrameCount        = 0x4ABBC;  // [LIVE] +1 per main-loop iteration
-inline constexpr uintptr_t kMgrFps               = 0x4B12C;  // [LIVE] engine's own 1/dt
+inline uintptr_t kMgrFrameCount        = 0x4ABBC;  // [LIVE] +1 per main-loop iteration (varies: 12 = 0x4A8B8)
+inline constexpr uintptr_t kMgrFps               = 0x4B12C;  // [LIVE] engine's own 1/dt (unused by code)
 inline constexpr uintptr_t kMgrOptionsConfig     = 0x2A33C;  // [VER]
 inline constexpr uintptr_t kMgrEnableInterp      = 0x2A3C0;  // [LIVE] optionsConfig + 0x84
 
@@ -83,8 +106,15 @@ inline constexpr uintptr_t kRoomScrollOfs = 0x1204;  // [VER]+[LIVE] float2, scr
 // snap. The position term is therefore quantised to the render-target pixel grid
 // independently of the camera, which is what makes a screen-locked sprite oscillate
 // one RT pixel against a smoothly scrolling background (the big-room walk shiver).
-inline constexpr uintptr_t kSnapScaleA = 0x00BF941C;  // [VER]+[LIVE] float 1.0
-inline constexpr uintptr_t kSnapScaleB = 0x00BF93E8;  // [VER]+[LIVE] float 2.0
+inline uintptr_t kSnapScaleA = 0x00BF941C;  // [VER]+[LIVE] float 1.0
+inline uintptr_t kSnapScaleB = 0x00BF93E8;  // [VER]+[LIVE] float 2.0
+
+// The CRT floor() every snap site calls. Each site is `mulss` by the scale product,
+// `addss` a 0.5 constant, `call floor`, `divss` back - i.e. round-to-nearest on the RT
+// grid. The sites are found at runtime by exactly that context (a direct E8 call to
+// floor with a 0.5 addss and a kSnapScaleA reference in the preceding bytes), never by
+// a hardcoded list: the compiler inlined the idiom dozens of times and a list would rot.
+inline uintptr_t kCrtFloor = 0x00AF0917;    // [VER] double floor(double), cdecl
 
 // Entity vtable layout. Slot 4 is the render-preview step; REPENTOGON's own
 // source marks it `skip; // Interpolate`.
@@ -121,7 +151,8 @@ inline constexpr uintptr_t kIntegratorTsRead[] = {0x006AEB95, 0x006AEBF9};  // [
 // The hardcoded 0.5 of the render preview. The constant at 0xBAA2D0 is shared by
 // 2810 instructions binary-wide — NEVER patch it in place. Patch the abs32 operand
 // of each mulss instead (operand sits at instruction+4).
-inline constexpr uintptr_t kConstHalfShared = 0x00BAA2D0;  // [VER] float 0.5, 2810 users
+inline uintptr_t kConstHalfShared = 0x00BAA2D0;  // [VER] float 0.5, 2810 users
+inline uintptr_t kConst065        = 0x00BAA324;  // [VER] float 0.65, world->screen
 inline constexpr uintptr_t kPreviewHalfOperand[] = {      // [VER] instruction+4
     0x006B0F43, 0x006B0F4B,  // base Interpolate (Player, Bomb, Slot, + delegated)
     0x0065C583, 0x0065C5A7,  // Projectile
@@ -134,25 +165,28 @@ inline constexpr uintptr_t kPreviewHalfOperand[] = {      // [VER] instruction+4
 // Everything here was read out of THIS binary, mostly by following the engine's own
 // "Colormod Surface" path in sub_6FBC10 — the same sequence we imitate: create a
 // procedural render target, push/bind it, draw, flush, pop, blit it full-screen.
-inline constexpr uintptr_t kGraphicsManager   = 0x00C798E0;  // [VER] +4 == kGWindowFlags
-inline constexpr uintptr_t kScreenWidth       = 0x00C79110;  // [VER] uint32, feeds every surface
-inline constexpr uintptr_t kScreenHeight      = 0x00C79114;  // [VER] uint32
-inline constexpr uintptr_t kOrthoWidth        = 0x00C78DC4;  // [VER] float, full-screen quad
-inline constexpr uintptr_t kOrthoHeight       = 0x00C78EDC;  // [VER] float
-inline constexpr uintptr_t kCurrentShader     = 0x00C379B8;  // [VER] written by kSelectShader
+inline uintptr_t kGraphicsManager   = 0x00C798E0;  // [VER] +4 == kGWindowFlags
+inline uintptr_t kScreenWidth       = 0x00C79110;  // [VER] uint32, feeds every surface
+inline uintptr_t kScreenHeight      = 0x00C79114;  // [VER] uint32
+inline uintptr_t kOrthoWidth        = 0x00C78DC4;  // [VER] float, full-screen quad
+inline uintptr_t kOrthoHeight       = 0x00C78EDC;  // [VER] float
+inline uintptr_t kCurrentShader     = 0x00C379B8;  // [VER] written by kSelectShader (0 on 12 = overlay off)
 
 // Manager fields, relative to kGraphicsManager.
 inline constexpr uintptr_t kMgrBlendState     = 0x20;  // [VER] 5 dwords, reset by Clear()
 inline constexpr uintptr_t kMgrCurRenderTgt   = 0x68;  // [VER] == 0x00C79948
 
 // [VER] all four confirmed by disassembly, including their stack cleanup:
-inline constexpr uintptr_t kPushRenderTarget  = 0x00683680;  // no args, retn
-inline constexpr uintptr_t kPopRenderTarget   = 0x006836C0;  // no args, retn ("stack is empty!")
-inline constexpr uintptr_t kSetRenderTarget   = 0x00A18300;  // thiscall(mgr, target, screenSized), retn 8
-inline constexpr uintptr_t kClearTarget       = 0x00A18230;  // thiscall(mgr), clears to (0,0,0,0)
-inline constexpr uintptr_t kFlushBatches      = 0x00A19180;  // thiscall(mgr, 1), retn 4
-inline constexpr uintptr_t kSelectShader      = 0x00A14050;  // stdcall(x) -> KAGE_ColorTextureShader
-inline constexpr uintptr_t kCreateRenderTgt   = 0x00A11F30;  // stdcall(&out, w, h, name, &color), retn 0x14
+// Overlay path only. On 1.9.7.12 the KAGE render pipeline was refactored (Clear/Flush
+// became vtable calls, CreateRenderTgt's arg order changed), so these are left 0 there
+// and the overlay is disabled - core high-FPS + subpixel do not touch them.
+inline uintptr_t kPushRenderTarget  = 0x00683680;  // no args, retn
+inline uintptr_t kPopRenderTarget   = 0x006836C0;  // no args, retn ("stack is empty!")
+inline uintptr_t kSetRenderTarget   = 0x00A18300;  // thiscall(mgr, target, screenSized), retn 8
+inline uintptr_t kClearTarget       = 0x00A18230;  // thiscall(mgr), clears to (0,0,0,0)
+inline uintptr_t kFlushBatches      = 0x00A19180;  // thiscall(mgr, 1), retn 4
+inline uintptr_t kSelectShader      = 0x00A14050;  // stdcall(x) -> KAGE_ColorTextureShader
+inline uintptr_t kCreateRenderTgt   = 0x00A11F30;  // stdcall(&out, w, h, name, &color), retn 0x14
 
 // ImageBase vtable slots, byte offsets confirmed at the engine's own call sites.
 inline constexpr int kVtImageRender    = 5;   // +0x14  Render(SourceQuad*, DestQuad*, KColor*)
@@ -164,7 +198,7 @@ inline constexpr uintptr_t kImgFilterCacheMag = 0x3C;
 // one place in the frame where compositing our own layer is guaranteed to be both legal
 // and correctly ordered. Exactly one caller (0x006FC0A6, inside the render function), and
 // its prologue `55 8B EC 6A FF` is 5 bytes on an instruction boundary.
-inline constexpr uintptr_t kLuaPostRender     = 0x00863680;  // [VER]
+inline uintptr_t kLuaPostRender     = 0x00863680;  // [VER]
 
 // The rollback loop that undoes previews before the authoritative tick.
 // Self-contained; iterates Game+0x125C (array) / +0x1264 (count).
@@ -175,5 +209,49 @@ inline constexpr uintptr_t kRollbackLoopEnd   = 0x0095522A;  // [VER]
 //                  0x9551D6 `75 60`               jnz -> preview branch
 // 9-byte window, nothing branches into it. [VER]
 inline constexpr uintptr_t kGateParity = 0x009551CF;
+
+// ---------------------------------------------------------- build selection
+// Called once at init with the host exe's PE TimeDateStamp, before any address above is
+// read. Leaves the 1.9.7.17 defaults in place for that build (and for any unknown stamp,
+// where the caller must still validate every patch site by its bytes before writing).
+// For 1.9.7.12 it retargets the addresses that moved. The wrapper-hook and limiter SITES
+// are not here - those live in their build-specific patch functions in dllmain, because
+// the code shape differs, not just the address.
+inline void SelectBuild(uint32_t timeDateStamp) {
+    if (timeDateStamp != kTimeDateStamp_1_9_7_12) return;   // defaults already = 1.9.7.17
+    g_build = kBuild_1_9_7_12;
+    g_isRepentogon = true;
+
+    kGManagerPtr   = 0x00BE4A1C;
+    kGameObjPtr    = 0x00BE49F4;
+    kGameTick      = 0x00025A70;   // Game::_frameCount (Game.zhl)
+    kMgrFrameCount = 0x0004A8B8;   // Manager::_framecount (Manager.zhl); the engine's own
+                                   // parity gate reads test byte[mgr+0x4A8B8],1
+
+    kConstHalfShared = 0x00B40178;
+    kConst065        = 0x00B401CC;
+    kSnapScaleA      = 0x00B88730;
+    kSnapScaleB      = 0x00B883E8;
+    kCrtFloor        = 0x00A882C2;
+    kOrthoWidth      = 0x00BE6F2C;
+    kOrthoHeight     = 0x00BE7298;
+    kScreenWidth     = 0x00BE729C;
+    kScreenHeight    = 0x00BE72A0;
+
+    kGraphicsManager = 0x00BAE190;   // g_KAGE_Graphics_Manager
+    kGWindowFlags    = 0x00BAE194;   // +4, as on 1.9.7.17
+    kLuaPostRender   = 0x00849DD0;
+
+    // Overlay pipeline: not ported (see the block that defines these). Zeroed so the
+    // overlay refuses to install on this build; dllmain also forces LuaOverlay off.
+    kCurrentShader   = 0;
+    kClearTarget     = 0;
+    kFlushBatches    = 0;
+    kSelectShader    = 0;
+    kCreateRenderTgt = 0;
+    kSetRenderTarget = 0x009E80F0;   // resolved but unused while overlay is off
+    kPushRenderTarget= 0x0067EDD0;
+    kPopRenderTarget = 0x0067EEB0;
+}
 
 }  // namespace isaac
