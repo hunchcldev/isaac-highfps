@@ -33,6 +33,43 @@ The game imports `winmm` statically, so Windows loads the mod before the game's 
 runs. Every export of the real `winmm.dll` is forwarded to the system copy, so nothing else in
 the process notices. No injector, no launcher, and nothing asks for elevated permissions.
 
+### REPENTOGON
+
+The REPENTOGON launcher does not run the game in the main folder. It keeps its own copy in
+`Repentogon\` next to it, patched down to the build REPENTOGON supports (v1.9.7.12.J273), and
+starts that `isaac-ng.exe` itself. So for REPENTOGON the DLL goes next to *that* executable:
+
+```
+Steam\steamapps\common\The Binding of Isaac Rebirth\Repentogon\winmm.dll
+```
+
+That copy is a different compilation of the game, and only builds of this mod that know it
+(this source; anything newer than v0.13.0) can go there. **Do not put v0.13.0 or older in
+`Repentogon\`.** Those builds know the Steam executable's addresses only, and the very first
+thing they read — the engine's manager pointer — sits 0x8CC80 bytes away from where the
+Repentogon copy keeps it, inside that image's Steam stub. What is there (`0x174E5452`) looks
+enough like a pointer to pass the sanity check, and the next line dereferences it. The DLL's
+startup thread dies, which takes the whole game process down, and it does so while the launcher
+is still injecting into the suspended game. What you see is the launcher reporting
+
+```
+[ERROR] Error encountered while injecting Repentogon, check log files
+[ERROR] Unable to kill Isaac process: 5
+```
+
+The second line is the tell: error 5 is what `TerminateProcess` returns for a process that has
+already died. `isaac-highfps.log` from such a launch stops within a line or two of
+`host exe = ...\Repentogon\isaac-ng.exe`, before any `installed` line.
+Deleting the DLL from `Repentogon\` (or replacing it with a build that knows that executable)
+fixes it; the main-folder install is unaffected either way.
+
+Two things differ on the Repentogon build. The Lua overlay is not ported to it, so mod
+callbacks run at the display rate there rather than being held at 60 (see *Mod compatibility*).
+And use `winmm.dll` rather than the `dbghelp.dll` alternative: REPENTOGON's own DLLs
+(`zhlLoader.dll`, `libzhl.dll`) import `dbghelp`, so under that name they would be binding to
+our forwarding copy instead of the system one. It should still work, but it is one more thing
+in the path for no gain. Nothing of REPENTOGON's imports `winmm`.
+
 ### If nothing happens at all
 
 No log file and no change in frame rate means the loader never picked the DLL up. The download
@@ -73,9 +110,10 @@ download, but the native part gets installed by hand.
 Three globals are published into the Lua state while this is running:
 
 ```lua
-HIGH_FPS_NATIVE   -- api version, absent when the native component isn't there
-HIGH_FPS_VERSION  -- release version, e.g. "0.13.0"; absent means 0.12.0 or older
-HIGH_FPS_RATE     -- frames per second measured over the last second
+HIGH_FPS_NATIVE        -- api version (3), absent when the native component isn't there
+HIGH_FPS_VERSION       -- release version, e.g. "0.13.0"; absent means 0.12.0 or older
+HIGH_FPS_RATE          -- frames per second measured over the last second
+HIGH_FPS_INTERMEDIATE  -- true while the frame being rendered is one vanilla never drew
 ```
 
 Read them per frame rather than once at load, since they appear on the first dispatch and that
@@ -84,6 +122,16 @@ can land after mods have finished loading.
 Counting `MC_POST_RENDER` to work out the frame rate does not work here, and the reason is the
 cadence gate below: that callback is deliberately held at 60 no matter how fast the game renders.
 `HIGH_FPS_RATE` exists because a mod can no longer measure the rate for itself.
+
+`HIGH_FPS_INTERMEDIATE` is for callbacks that do run per rendered frame (the per-entity render
+callbacks everywhere; every render callback on the Repentogon build). Anything that counts
+frames or reads input can skip the work when it is true and behave exactly as it did at 60.
+The DLL already does this for the two input edge functions: `Input.IsActionTriggered` and
+`Input.IsButtonTriggered` are wrapped to answer `false` on intermediate frames, because the
+engine polls input 60 times a second and an edge it reported on the real frame would otherwise be
+reported again on every frame rendered before the next poll — two or three times per key press.
+Held state (`IsActionPressed`, `IsButtonPressed`) is untouched. `InputEdgeGate = 0` in the ini
+turns the wrapping off.
 
 ## Configuration
 
@@ -96,6 +144,9 @@ Interpolate       = 1   ; 0 = uncap the frame rate but do not add intermediate p
 MaxFps            = 0   ; 0 = whatever the display allows; otherwise a cap, e.g. 120
 LuaVanillaCadence = 1   ; hold the mod render pass at 60 Hz, see Mod compatibility
 LuaOverlay        = 1   ; composite what mods draw onto every frame
+InputEdgeGate     = 1   ; report a key press once per input poll, not once per frame
+RayCadence        = 1   ; keep the stage light rays' glimmer at its 60 Hz pace
+SceneMotion       = 1   ; smooth the room-transition slide and the main-menu camera too
 Log               = 1   ; writes %TEMP%\isaac-highfps.log
 Diag              = 0   ; per-frame render-state dump into the log, for stutter reports
 ```
@@ -131,6 +182,11 @@ One consequence worth naming: a mod drawing in both the main pass and a per-enti
 to see them once each per frame and now sees the main pass less often. `LuaVanillaCadence = 0`
 turns the whole thing off and gives every callback the display rate, at the cost above.
 
+Holding Lua back is only ever right while the layer that carries its output is live, so with the
+overlay off (by config, after a fault, or on the Repentogon build where it is not ported) the gate
+stays installed but lets every dispatch through. Mod callbacks then run at the display rate, the
+pre-v0.10.0 behaviour. The log says which of the two you are getting.
+
 ## How it works
 
 Three changes, all applied to the running process in memory. No files are modified.
@@ -153,6 +209,44 @@ trampoline hook on the engine's update wrapper calls it on a real-time schedule 
 Both of Isaac's clocks, the render frame counter and the gameplay tick, then advance exactly as
 they always did. That matters more than it sounds: roughly 52 places in the binary test the
 frame counter's parity, and several more read it modulo 4, modulo 30, or shifted right by one.
+
+### Menus and room transitions
+
+Two more things move while the gameplay clock stands still, and both are plain engine fields the
+renderer reads as they are:
+
+- **The slide between rooms.** `RoomTransition` lives inline in `Game`; `Game::Update` steps its
+  counter once per 30 Hz tick and stores `progress = counter / duration`, and
+  `RoomTransition::Render` eases that (3t² − 2t³) into the offset both rooms are drawn at. Vanilla
+  draws every step twice. The progress is previewed per rendered frame between its last two
+  values, so the slide moves at the display rate.
+- **The main menu's camera.** `MenuManager::_ViewPosition` is eased toward the selected page once
+  per 60 Hz frame and added to everything the menu draws. Same treatment, on the frame cadence.
+
+Interpolation, not extrapolation: one frame of latency on a slide is invisible and an overshoot on
+its final step is not — and the ease-out means the step we lag behind by is nearly nothing. A cut
+(a page switch, the transition's progress reset) is detected and shown as a cut.
+
+The loop used to rest at 60 whenever the gameplay clock stood still for a quarter second, which is
+exactly what happens during both of these. It now keeps its full rate while either is moving, and
+still rests when nothing is.
+
+What this does *not* smooth: things that are animations rather than motions. The pause menu's
+appear/disappear, the HUD's pickup slides, the nightmare and boss-intro sequences and every menu
+sprite are ANM2 animations stepping through keyframes, and loading screens are static. Giving
+those more frames would need interpolating animation keyframes themselves (what REPENTOGON's
+"InterpolV2" does for its half-step), which is a different project; with `SceneMotion` on, those
+moments simply run at the engine's own cadence.
+
+### What the renderer animates on its own
+
+Not everything the engine animates lives in the update. The stage overlay (`FXLayers::Render`,
+Cathedral's light shafts and the rays some Basement rooms roll) steps each ray's phase by its
+speed every time it is *drawn*, and the brightness is `(sin(phase) + 1) / 2`. That was a 60 Hz
+animation only because vanilla drew 60 times a second; free-running, it glimmered 2.75× too fast
+at 165 Hz. The three-instruction advance is lifted into a stub that runs it on real frames only.
+It is the one render-side animation found in the overlay code; anything similar elsewhere would
+get the same treatment.
 
 ### The frames in between get real positions
 
