@@ -1,5 +1,76 @@
 # Changelog
 
+## Unreleased
+
+**The REPENTOGON build of the game is supported.** The launcher does not run the Steam
+executable; it keeps a patched copy (v1.9.7.12.J273) in `Repentogon\` and starts that. It is
+a different compilation — every image address moved and the frame limiter and update
+wrapper have a different shape — so the DLL now reads the PE timestamp of whichever
+executable loaded it and selects the address set to match. Struct offsets are the same on
+both. The Lua overlay is not ported to that build, so mod callbacks run at the display rate
+there (the gate only holds Lua back while the overlay is live).
+
+**Why v0.13.0 could not go in that folder, and why that looked like a launcher bug.** Put
+next to the Repentogon copy, v0.13.0 made the launcher print `Error encountered while
+injecting Repentogon` and then `Unable to kill Isaac process: 5`. Neither line is about
+the launcher. The launcher starts the game suspended and injects from a remote thread;
+loading the executable's static imports — us — happens on that thread, and our startup
+thread then went looking for the manager pointer at its 1.9.7.17 address, 0x8CC80 bytes
+above where the 1.9.7.12 image keeps it. On that image the address lands inside `.bind`,
+the Steam stub, and holds `0x174E5452`; that passed the `>= 0x10000` sanity check, and
+the very next line dereferenced it at `0x1753000E` for the frameCount log. An unhandled
+fault on any thread ends the process, and the process died while the launcher's thread
+was still inside it. The launcher saw its remote
+thread end with an exception code and tried to kill a process that was already gone;
+error 5 is what `TerminateProcess` returns for exactly that. The byte checks that are
+meant to refuse an unknown build never ran, because the thread that would have run them
+was the one that faulted.
+
+**Room transitions and the main menu run at the display rate too.** Both were held at 60
+on purpose: the loop rests when the gameplay clock stands still, and it stands still during
+both. Resting there was the right call as long as the extra frames would have been
+duplicates — the slide between rooms is a counter `Game::Update` steps 30 times a second
+(`RoomTransition::_progress`, eased in its Render as 3t² − 2t³), and the menu camera
+(`MenuManager::_ViewPosition`) is eased once per 60 Hz frame. Now both are previewed on
+every rendered frame the way the room scroll is — sampled at real frames, interpolated
+between the last two samples before each render, restored before the engine runs — and the
+loop keeps its full rate while either is moving. Interpolation rather than extrapolation
+because an overshoot on the slide's last step would show and one frame of lag does not; a
+cut (page switch, the transition's progress reset) is detected and left as a cut.
+`SceneMotion = 0` turns it off. Not covered, because they are keyframed animations rather
+than motions: the pause menu, HUD slides, the nightmare and boss-intro sequences.
+
+**The light rays glimmer at their old pace again (#9).** Cathedral's light shafts, and the
+rays some Basement rooms roll, pulsed 2.75x too fast at 165 Hz. Not everything the engine
+animates lives in the update: `FXLayers::Render` steps every ray's phase by its speed on
+each call, and `Room::Render` calls it once per rendered frame — a 60 Hz animation only
+because vanilla rendered 60 times a second. The brightness is `(sin(phase) + 1) / 2`. The
+three-instruction advance is now lifted into a stub that runs it on real frames and skips
+it on intermediate ones, on both builds (`RayCadence = 0` restores the old behaviour).
+Anything else the engine animates from a render function would get the same treatment;
+this is the one the report named, and the one the stage overlay code contains.
+
+**A key press is reported once, not once per rendered frame (#10).** Mod Config Menu's
+cursor skipped several entries per press on the Repentogon build. MCM navigates from
+`MC_POST_RENDER` with `Input.IsActionTriggered`, and "triggered" is an edge of the 60 Hz
+input poll: it stays true until the next poll. Vanilla renders exactly once per poll, so a
+render callback sees each press once; we render two or three times per poll, so without
+the cadence gate it saw each press two or three times. On 1.9.7.17 the gate hid this for
+the mod render pass; on 1.9.7.12 the gate is idle (no overlay), and the per-entity render
+callbacks never had the protection on either build. `Input.IsActionTriggered` and
+`Input.IsButtonTriggered` are now wrapped inside the VM to answer `false` on a frame the
+engine never polled for, which is the vanilla semantic restored rather than a heuristic.
+Held state is untouched. `HIGH_FPS_INTERMEDIATE` is published alongside, so a mod that
+counts render frames can do the same for itself. `InputEdgeGate = 0` turns it off. What
+this does not fix: MCM's hold-to-repeat counts render frames, so on 1.9.7.12 holding a key
+still scrolls faster than at 60 until the overlay is ported to that build.
+
+**Unknown builds are now a no-op, as the README always claimed.** Every build-specific
+address is checked to be mapped before its first read, not just compared before its first
+write: the manager slot, the manager pointer it yields, every patch site and both wrapper
+hook shapes. The sub-pixel scan takes its `.text` bounds from the section table instead of
+a 1.9.7.17 constant, so it cannot run on into `.rdata` on a build whose code ends earlier.
+
 ## v0.13.0
 
 **The companion can now tell you the DLL is outdated.** The two halves of this mod age

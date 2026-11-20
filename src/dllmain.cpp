@@ -45,6 +45,9 @@ struct Config {
     bool luaVanillaCadence = true;   // pin mod callbacks to the vanilla 60 Hz
     bool luaOverlay = true;          // and composite what they draw onto every frame
     bool subpixelSprites = true;     // neutralise the renderer's RT-pixel snapping
+    bool inputEdgeGate = true;       // report an input edge once per poll, not once per frame
+    bool rayCadence = true;          // keep the stage light rays' glimmer at its 60 Hz pace
+    bool sceneMotion = true;         // smooth the room-transition slide and the menu camera too
 } g_cfg;
 
 void LoadConfig() {
@@ -64,17 +67,47 @@ void LoadConfig() {
     g_cfg.luaVanillaCadence = GetPrivateProfileIntA("highfps", "LuaVanillaCadence", 1, path) != 0;
     g_cfg.luaOverlay        = GetPrivateProfileIntA("highfps", "LuaOverlay", 1, path) != 0;
     g_cfg.subpixelSprites   = GetPrivateProfileIntA("highfps", "SubpixelSprites", 1, path) != 0;
+    g_cfg.inputEdgeGate     = GetPrivateProfileIntA("highfps", "InputEdgeGate", 1, path) != 0;
+    g_cfg.rayCadence        = GetPrivateProfileIntA("highfps", "RayCadence", 1, path) != 0;
+    g_cfg.sceneMotion       = GetPrivateProfileIntA("highfps", "SceneMotion", 1, path) != 0;
 }
 
 inline uint8_t* Addr(uintptr_t staticVa) {
     return reinterpret_cast<uint8_t*>(g_base + (staticVa - isaac::kImageBase));
 }
 
-// Refuse to patch anything we do not recognise. The offsets are pinned to build
-// v1.9.7.17; on any other build these checks are the only thing between us and a
+// True if [p, p+n) is committed, non-guard, readable memory right now.
+//
+// Every build-specific address is checked through this before its first dereference. The
+// byte comparisons below only protect a WRITE; the read that feeds them can already fault
+// when the address falls outside the image, and the two builds we know lay their data out
+// 0x8CC80 bytes apart. An unhandled fault on this thread takes the whole process down -
+// and under the REPENTOGON launcher that happens while the launcher's remote thread is
+// still inside the suspended game, so the user never sees a crash, only "Error encountered
+// while injecting Repentogon" followed by "Unable to kill Isaac process: 5"
+// (TerminateProcess on a process that has already died returns ERROR_ACCESS_DENIED).
+bool Readable(const void* p, size_t n) {
+    const uint8_t* b = static_cast<const uint8_t*>(p);
+    const uint8_t* end = b + n;
+    while (b < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(b, &mbi, sizeof mbi)) return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        if ((mbi.Protect & 0xFF) == PAGE_NOACCESS || (mbi.Protect & PAGE_GUARD)) return false;
+        b = static_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+    }
+    return true;
+}
+
+// Refuse to patch anything we do not recognise. The offsets are pinned to the two builds
+// in offsets.h; on any other build these checks are the only thing between us and a
 // crash in someone else's save file.
 bool Expect(uintptr_t va, const uint8_t* want, size_t n, const char* what) {
     uint8_t* p = Addr(va);
+    if (!Readable(p, n)) {
+        Log("[FATAL] %s @ 0x%08X: address is not mapped - wrong game build?", what, va);
+        return false;
+    }
     if (memcmp(p, want, n) == 0) return true;
     char got[128] = {0};
     for (size_t i = 0; i < n && i < 16; ++i)
@@ -457,6 +490,154 @@ void PreviewCamera(float /*unused*/) {
     }
 }
 
+// ------------------------------------------------------------ scene motion
+// Outside the room, two more things move continuously and are read by the renderer straight
+// out of engine state that only advances on a fixed cadence:
+//
+//   - the room-transition slide: RoomTransition::_progress, stepped once per 30 Hz tick by
+//     Game::Update and eased by RoomTransition::Render into the offset both rooms are drawn
+//     at. Vanilla draws each step twice; we would draw it five or six times.
+//   - the main menu's camera: MenuManager::_ViewPosition, eased toward the selected page
+//     once per 60 Hz wrapper call and added to everything MenuManager::Render draws.
+//
+// Both get the room-scroll treatment: sample the authoritative value at real frames, write
+// an interpolated one before every render, put the authoritative one back before the engine
+// runs again (Update eases from the current value, so it must never see ours). Interpolation
+// between the last two samples rather than extrapolation: one frame of latency on a slide is
+// invisible, an overshoot on its last step is not, and the slide's ease-out makes the step
+// we lag behind by negligible anyway. A jump (a page switch, the progress reset between
+// transition phases) is detected and not smeared across.
+//
+// These also decide whether the loop may rest at 60: the gameplay clock stands still during
+// both, so without them the pacing would see a frozen world and cap exactly the frames that
+// would have made the motion smooth.
+struct SceneTrack {
+    float prev[2], cur[2];
+    bool  valid;      // prev/cur hold two consecutive samples of the same motion
+    bool  applied;    // a preview currently sits in the live field
+    bool  moving;     // last two samples differ
+    int   key;        // identity of the motion (transition mode); a change means "fresh"
+};
+SceneTrack g_trans = {}, g_menu = {};
+bool g_sceneMoving = false;   // read by the pacing: continuous motion while the world is frozen
+
+uint8_t* RoomTransitionObj() {
+    const uintptr_t game = GameObj();
+    return game >= 0x10000 ? reinterpret_cast<uint8_t*>(game + isaac::kRoomTransitionInGame) : nullptr;
+}
+
+// Game::Render only hands the frame to RoomTransition::Render in modes 2 and 3; in every
+// other mode _progress is not what is on screen, so there is nothing to preview.
+inline bool TransitionDrawn(const uint8_t* rt) {
+    const int mode = *reinterpret_cast<const int*>(rt + isaac::kRtMode);
+    return mode == 2 || mode == 3;
+}
+
+// The menu camera exists only while the Manager is in its menu state; in the game the same
+// bytes belong to a menu nobody draws, and writing them would be pointless but harmless.
+float* MenuView() {
+    const uintptr_t mgr = *reinterpret_cast<uintptr_t*>(Addr(isaac::kGManagerPtr));
+    if (mgr < 0x10000 || *reinterpret_cast<int*>(mgr + isaac::kMgrState) != 1) return nullptr;
+    const uintptr_t mm = *reinterpret_cast<uintptr_t*>(Addr(isaac::kGMenuManager));
+    return mm >= 0x10000 ? reinterpret_cast<float*>(mm + isaac::kMenuViewPosition) : nullptr;
+}
+
+void SceneSample(SceneTrack& t, const float* live, int n, int key, float jumpSq) {
+    bool fresh = !t.valid || key != t.key;
+    if (!fresh) {
+        float d2 = 0.0f;
+        for (int i = 0; i < n; ++i) { const float d = live[i] - t.cur[i]; d2 += d * d; }
+        if (d2 > jumpSq) fresh = true;   // a cut, not a motion: show it as one
+    }
+    t.moving = false;
+    for (int i = 0; i < n; ++i) {
+        t.prev[i] = fresh ? live[i] : t.cur[i];
+        t.cur[i]  = live[i];
+        if (t.prev[i] != t.cur[i]) t.moving = true;
+    }
+    t.key = key; t.valid = true; t.applied = false;
+}
+
+// The transition's own clock: the counter value behind the current sample and when the
+// engine stepped it. The slide is timed from here, not from g_lastTickTime.
+int    g_transCounter = 0;
+double g_transStepAt  = 0.0;
+
+// Once per real (60 Hz) frame, right after the engine ran. Deliberately NOT gated on our
+// logicPhase: that flag is set on the frame *after* the engine's logic (Manager::Update
+// runs Game::Update when the counter is even on entry, `test byte[mgr+fc],1 / jnz preview`,
+// on both builds). A tick-gated sample therefore always landed one frame late - after our
+// own preview had already overwritten the freshly stepped _progress - and the rollback then
+// fed that stale value back as "authoritative". The slide froze at its first step for each
+// half and snapped at the end: the shift.
+//
+// So progress is never read back from the float we write. It is recomputed from _counter
+// and _duration, exactly as RoomTransition::Update does at its end (0x8272C7), from two
+// ints only the engine touches; a step is a change in (mode, counter), timed when we see it.
+void SampleTransition() {
+    uint8_t* rt = RoomTransitionObj();
+    const int duration = rt ? *reinterpret_cast<int*>(rt + isaac::kRtDuration) : 0;
+    if (!rt || !TransitionDrawn(rt) || duration <= 0) {
+        g_trans.valid = g_trans.applied = g_trans.moving = false;
+        return;
+    }
+    const int mode    = *reinterpret_cast<int*>(rt + isaac::kRtMode);
+    const int counter = *reinterpret_cast<int*>(rt + isaac::kRtCounter);
+    if (g_trans.valid && mode == g_trans.key && counter == g_transCounter) {
+        // No step this frame. Two ticks without one means the slide is holding still.
+        g_trans.applied = false;
+        if (Now() - g_transStepAt > 2.0 * kTickPeriod) g_trans.moving = false;
+        return;
+    }
+    const float p = float(counter) / float(duration);
+    // Mode 2 -> 3 resets the counter (and the mode key catches it); 0.5 of the whole slide
+    // in one tick is a reset, never a step.
+    SceneSample(g_trans, &p, 1, mode, 0.5f * 0.5f);
+    g_transCounter = counter;
+    g_transStepAt  = Now();
+}
+
+// Once per real (60 Hz) frame, right after MenuManager::Update eased the camera.
+void SampleMenu() {
+    const float* v = MenuView();
+    if (!v) { g_menu.valid = g_menu.applied = g_menu.moving = false; return; }
+    // Pages sit hundreds of units apart and the ease never covers more than a fraction of
+    // that in one frame; anything larger is a hard cut to another page.
+    SceneSample(g_menu, v, 2, 0, 400.0f * 400.0f);
+}
+
+void PreviewTransition() {
+    if (!g_trans.valid) return;
+    uint8_t* rt = RoomTransitionObj();
+    if (!rt || !TransitionDrawn(rt)) return;
+    const double a = (Now() - g_transStepAt) / kTickPeriod;
+    const float tickAlpha = float(a < 0.0 ? 0.0 : (a > 1.0 ? 1.0 : a));
+    *reinterpret_cast<float*>(rt + isaac::kRtProgress) =
+        g_trans.prev[0] + tickAlpha * (g_trans.cur[0] - g_trans.prev[0]);
+    g_trans.applied = true;
+}
+
+void PreviewMenu(float frameAlpha) {
+    if (!g_menu.valid) return;
+    float* v = MenuView();
+    if (!v) return;
+    for (int i = 0; i < 2; ++i) v[i] = g_menu.prev[i] + frameAlpha * (g_menu.cur[i] - g_menu.prev[i]);
+    g_menu.applied = true;
+}
+
+// Before the engine runs: the authoritative value back in, exactly as the camera does it.
+void RollbackScene() {
+    if (g_trans.applied) {
+        if (uint8_t* rt = RoomTransitionObj())
+            *reinterpret_cast<float*>(rt + isaac::kRtProgress) = g_trans.cur[0];
+        g_trans.applied = false;
+    }
+    if (g_menu.applied) {
+        if (float* v = MenuView()) { v[0] = g_menu.cur[0]; v[1] = g_menu.cur[1]; }
+        g_menu.applied = false;
+    }
+}
+
 // ------------------------------------------------------------- diagnosis
 // Per-frame dump of exactly the state the following render pass will read. The external
 // RPM probe cannot answer "what does the render see": it races our own write sequence and
@@ -494,6 +675,7 @@ void RollbackPreviews() {
         }
     });
     RollbackCamera();
+    RollbackScene();
 }
 
 // We do NOT call the engine's Interpolate for these frames. Its per-type overrides are
@@ -550,6 +732,15 @@ void PreviewPass(float worldAlpha, float playerAlpha) {
     // real frames too: the drawn frame has to follow the same rule as the intermediate
     // ones, or the locked player would step once per 60 Hz refresh.
     PreviewCamera(playerAlpha);
+
+    // The slide follows its own step clock, the menu camera the 60 Hz frame. The frame alpha
+    // is computed here rather than taken from playerAlpha, which is deliberately zero while
+    // the world stands still - and the world always stands still during both of these.
+    if (g_cfg.sceneMotion) {
+        PreviewTransition();
+        const double f = (Now() - g_lastWrapperTime) / kWrapperPeriod;
+        PreviewMenu(float(f < 0.0 ? 0.0 : (f > 1.0 ? 1.0 : f)));
+    }
 }
 
 // Called right after an authoritative tick, when positions are real and no preview is
@@ -743,8 +934,13 @@ int __cdecl HookedUpdateWrapper() {
     // and GPU from exactly that work. Once the gameplay clock has stood still for a while
     // (a load, a menu, a long cutscene) there is nothing new to show anyway, so we drop
     // to 60. The delay before it kicks in keeps short room-slide transitions at full rate.
+    //
+    // "Nothing new to show" has to mean exactly that. The gameplay clock also stands still
+    // during a room transition and in the main menu, and both have continuous motion of
+    // their own that we preview (see scene motion). While either is moving the loop keeps
+    // its full rate; a frozen clock alone no longer decides.
     int targetFps = g_cfg.maxFps;
-    if (!g_worldAdvancing && g_frozenSince > 0.0 && Now() - g_frozenSince > 0.25)
+    if (!g_worldAdvancing && !g_sceneMoving && g_frozenSince > 0.0 && Now() - g_frozenSince > 0.25)
         if (targetFps == 0 || targetFps > 60) targetFps = 60;
 
     if (targetFps > 0) {
@@ -815,7 +1011,7 @@ int __cdecl HookedUpdateWrapper() {
             " engine-upd avg %.2f max %.1f | render~%.2f | ours avg %.3f max %.2f |"
             " ents<=%u | hitches %u",
             (unsigned long long)g_loopFrames, (unsigned long long)g_wrapperCalls,
-            g_worldAdvancing ? "moving" : "frozen", vsync ? "ON" : "off",
+            g_worldAdvancing ? "moving" : (g_sceneMoving ? "frozen+scene" : "frozen"), vsync ? "ON" : "off",
             iterAvg * 1000.0, g_prof.iterMax * 1000.0,
             updAvg * 1000.0, g_prof.updMax * 1000.0,
             renderAvg * 1000.0,
@@ -957,6 +1153,13 @@ int __cdecl HookedUpdateWrapper() {
             // the logic phase, so it is sampled here unconditionally - a 30 Hz sample would
             // miss half its motion.
             SampleCamera();
+            // Both scene motions are sampled every real frame: the menu camera moves on each
+            // one, and the transition detects its own steps (see SampleTransition).
+            if (g_cfg.sceneMotion) {
+                SampleTransition();
+                SampleMenu();
+                g_sceneMoving = g_trans.moving || g_menu.moving;
+            }
 
             // This frame gets rendered too, so it has to follow the same rule as the
             // intermediate ones. Left alone it would show the engine's own half-step
@@ -992,6 +1195,11 @@ bool InstallWrapperHook17() {
     // absolute address, so the loader rebases it: comparing against the on-disk bytes
     // fails by exactly the ASLR delta. Check the opcode and the *relocated* operand.
     uint8_t* site = Addr(isaac::kManagerUpdateWrp);
+    if (!Readable(site, 5)) {
+        Log("[FATAL] update wrapper @ 0x%08X is not mapped - wrong game build?",
+            isaac::kManagerUpdateWrp);
+        return false;
+    }
     const uint32_t wantOperand = 0x00C5C510u + (g_base - isaac::kImageBase);
     if (site[0] != 0x68 || *reinterpret_cast<uint32_t*>(site + 1) != wantOperand) {
         Log("[FATAL] update wrapper prologue @ 0x%08X: got %02X %08X, expected 68 %08X"
@@ -1033,6 +1241,10 @@ bool InstallWrapperHook12() {
     constexpr uintptr_t kBlock = 0x0090AEFF;
     constexpr size_t    kBlockLen = 14;
     uint8_t* site = Addr(kBlock);
+    if (!Readable(site, kBlockLen)) {
+        Log("[FATAL] 12 update block @ 0x%08X is not mapped - wrong game build?", (unsigned)kBlock);
+        return false;
+    }
 
     // Shape guard: the two rel32 operands vary with ASLR, so verify the fixed bytes and
     // that both relocated call targets are where we expect.
@@ -1180,9 +1392,27 @@ int InstallSubpixel() {
         return 0;
     }
 
-    constexpr uintptr_t kTextBegin = 0x00401000, kTextEnd = 0x00AF0000;
-    const uint8_t* text = Addr(kTextBegin);
-    const size_t len = kTextEnd - kTextBegin;
+    // The scan window is .text as the section table describes it, not a constant: the two
+    // builds end their code some 0x60000 apart, and a fixed 1.9.7.17 window run over the
+    // 1.9.7.12 image spills into .rdata, where an accidental match would mean patching data.
+    uintptr_t textBegin = 0, textEnd = 0;
+    {
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(g_base);
+        auto* nt  = reinterpret_cast<IMAGE_NT_HEADERS32*>(g_base + dos->e_lfanew);
+        auto* sec = IMAGE_FIRST_SECTION(nt);
+        for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+            if (memcmp(sec->Name, ".text\0\0\0", 8) != 0) continue;
+            textBegin = g_base + sec->VirtualAddress;
+            textEnd   = textBegin + sec->Misc.VirtualSize;
+            break;
+        }
+    }
+    if (!textBegin || textEnd <= textBegin + 0x100 || !Readable(reinterpret_cast<void*>(textBegin), textEnd - textBegin)) {
+        Log("[subpixel] no readable .text section in the host image - not patching");
+        return 0;
+    }
+    const uint8_t* text = reinterpret_cast<const uint8_t*>(textBegin);
+    const size_t len = textEnd - textBegin;
     int patched = 0;
 
     for (size_t i = 0x50; i + 5 <= len; ++i) {
@@ -1211,7 +1441,7 @@ int InstallSubpixel() {
     // milliseconds each, and two hundred of those is a visible startup stall. Same
     // ordering rule as Poke - protection changes strictly outside the freeze.
     DWORD old = 0;
-    uint8_t* base = Addr(kTextBegin);
+    uint8_t* base = reinterpret_cast<uint8_t*>(textBegin);
     if (!VirtualProtect(base, len, PAGE_EXECUTE_READWRITE, &old)) return 0;
     FreezeOtherThreads();
     for (int k = 0; k < patched; ++k) {
@@ -1222,6 +1452,67 @@ int InstallSubpixel() {
     ThawOtherThreads();
     VirtualProtect(base, len, old, &old);
     return patched;
+}
+
+// ------------------------------------------------------ stage light rays
+// Not everything the engine animates lives in the update. FXLayers::Render, the per-stage
+// overlay behind Cathedral's light shafts and the rays some Basement rooms roll, steps
+// each ray's phase by its speed on every call, and it is called once per rendered frame.
+// Vanilla renders 60 times a second, so that was a 60 Hz glimmer; free-running, it is a
+// display-rate one - 2.75x too fast at 165 Hz, which is issue #9. The brightness is
+// (sin(phase) + 1) / 2 a few lines earlier in the same loop.
+//
+// The advance is three self-contained instructions (no rel32, no abs32), the flags are
+// clobbered immediately after by the loop's own `add esi,14h`, and xmm0 is dead after the
+// store. So they lift cleanly into a stub: on a real frame run them as they were, on an
+// intermediate frame skip them. The rays then advance exactly as often as vanilla did.
+// The 18 bytes are copied from the live site rather than hardcoded, since the two builds
+// differ only in how the SIB byte orders base and index.
+bool InstallRayPhaseGate() {
+    constexpr size_t kLen = 18;
+    uint8_t* site = Addr(isaac::kRayPhaseAdvance);
+    if (!Readable(site, kLen + 3)) {
+        Log("[FATAL] ray phase advance @ 0x%08X is not mapped - wrong game build?",
+            (unsigned)isaac::kRayPhaseAdvance);
+        return false;
+    }
+    // Shape guard: movss xmm0,[b+i+4] / addss xmm0,[b+i+8] / movss [b+i+8],xmm0 with one
+    // and the same SIB byte in all three, followed by add esi,14h.
+    const uint8_t sib = site[4];
+    const bool shape =
+        site[0] == 0xF3 && site[1] == 0x0F && site[2] == 0x10 && site[3] == 0x44 && site[5] == 0x04 &&
+        site[6] == 0xF3 && site[7] == 0x0F && site[8] == 0x58 && site[9] == 0x44 && site[10] == sib && site[11] == 0x08 &&
+        site[12] == 0xF3 && site[13] == 0x0F && site[14] == 0x11 && site[15] == 0x44 && site[16] == sib && site[17] == 0x08 &&
+        site[18] == 0x83 && site[19] == 0xC6 && site[20] == 0x14;
+    if (!shape) {
+        char got[80] = {0};
+        for (size_t i = 0; i < kLen + 3; ++i) sprintf(got + strlen(got), "%02X ", site[i]);
+        Log("[FATAL] ray phase advance @ 0x%08X: unexpected shape (%s) - wrong game build?",
+            (unsigned)isaac::kRayPhaseAdvance, got);
+        return false;
+    }
+
+    uint8_t* stub = static_cast<uint8_t*>(
+        VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!stub) return false;
+    uint8_t* w = stub;
+    // cmp dword ptr [g_luaFrameIntermediate], 0   (83 3D disp32 00)
+    *w++ = 0x83; *w++ = 0x3D;
+    *reinterpret_cast<uint32_t*>(w) = static_cast<uint32_t>(
+        reinterpret_cast<uintptr_t>(&g_luaFrameIntermediate));
+    w += 4; *w++ = 0x00;
+    // jne skip   (over the 18 bytes of the original advance)
+    *w++ = 0x75; *w++ = static_cast<uint8_t>(kLen);
+    memcpy(w, site, kLen); w += kLen;
+    // skip: jmp back to the add esi,14h
+    WriteRel32Jmp(w, site + kLen);
+
+    uint8_t patch[kLen];
+    patch[0] = 0xE9;
+    *reinterpret_cast<int32_t*>(patch + 1) = static_cast<int32_t>(
+        reinterpret_cast<uintptr_t>(stub) - (reinterpret_cast<uintptr_t>(site) + 5));
+    memset(patch + 5, 0x90, kLen - 5);
+    return Poke(isaac::kRayPhaseAdvance, patch, kLen);
 }
 
 // ------------------------------------------------ file probe cache
@@ -2025,6 +2316,9 @@ using LuaPushnilFn = void(__cdecl*)(void*);
 using LuaPushIntFn = void(__cdecl*)(void*, intptr_t);
 using LuaPushStrFn = const char*(__cdecl*)(void*, const char*);
 using LuaSetGlobalFn = void(__cdecl*)(void*, const char*);
+using LuaPushBoolFn = void(__cdecl*)(void*, int);
+using LuaToBoolFn   = int (__cdecl*)(void*, int);
+using LuaLoadStrFn  = int (__cdecl*)(void*, const char*);   // luaL_loadstring
 using LuaPcallkFn  = int (__cdecl*)(void*, int, int, int, intptr_t, void*);
 using LuaCallkFn   = void(__cdecl*)(void*, int, int, intptr_t, void*);
 
@@ -2034,6 +2328,9 @@ LuaPushnilFn g_luaPushnil = nullptr;
 LuaPushIntFn g_luaPushInt = nullptr;
 LuaPushStrFn g_luaPushStr = nullptr;
 LuaSetGlobalFn g_luaSetGlobal = nullptr;
+LuaPushBoolFn g_luaPushBool = nullptr;
+LuaToBoolFn   g_luaToBool   = nullptr;
+LuaLoadStrFn  g_luaLoadStr  = nullptr;
 LuaPcallkFn  g_realPcallk = nullptr;
 LuaCallkFn   g_realCallk  = nullptr;
 
@@ -2080,16 +2377,95 @@ void EmulateLuaCall(void* L, int nargs, int nresults) {
 // Both are set from inside a dispatch, where a valid lua_State is in hand. Each push is
 // balanced by the setglobal that pops it, so the stack the engine is mid-call on is
 // untouched. Keyed on the state pointer, so a reloaded VM gets them again.
-constexpr intptr_t kNativeApiVersion = 2;
+constexpr intptr_t kNativeApiVersion = 3;   // 3: HIGH_FPS_INTERMEDIATE + the input edge gate
 
 void* g_lastLuaState = nullptr;
 LONG g_publishedRate = 0;
+LONG g_publishedIntermediate = -1;
+
+// ---- input edge gate ----------------------------------------------------------------
+// The engine polls input once per 60 Hz frame, in the pre-step our wrapper hook replays
+// on real frames only. "Triggered" is an edge in that poll: true from the poll that saw
+// the key go down until the next poll. Vanilla renders exactly once per poll, so a mod
+// asking Input.IsActionTriggered from a render callback sees each press exactly once.
+// Our intermediate frames render two or three more times per poll with the edge still
+// standing, so the same press is reported two or three times - which is precisely Mod
+// Config Menu's cursor skipping several entries per key press (issue #10). MCM, like a
+// great many mods, navigates from MC_POST_RENDER.
+//
+// On 1.9.7.17 the cadence gate hides this for the mod render pass by not running it on
+// intermediate frames at all. It does not hide it for the per-entity render callbacks,
+// which run every frame by design, and on the 1.9.7.12 build the gate is idle because the
+// overlay it depends on is not ported, so there MC_POST_RENDER itself sees the repeats.
+//
+// The fix restores the vanilla semantic directly: on an intermediate frame no poll has
+// happened since the edge was already reported, so the edge is not reported again. The
+// two edge functions are wrapped inside the VM, from the same dispatch that publishes
+// the presence globals, and consult a per-frame global we keep current. Held state
+// (IsActionPressed / IsButtonPressed) is left exactly as it is: "is the key down right
+// now" is as true on an intermediate frame as on a real one, and hold-to-show mods draw
+// from it on every frame. The one thing this does not restore is the pace of hold-repeat
+// counters that count render frames (MCM's auto-scroll after 20 frames held), which on
+// 1.9.7.12 still run at the display rate until the overlay is ported there.
+//
+// Wrapping in Lua rather than detouring InputManager::IsActionTriggered keeps it build-
+// independent and lets REPENTOGON keep whatever it does to the Input table: a wrapper
+// installed into the table works however the underlying function is implemented. A mod
+// that cached Input.IsActionTriggered into a local before our first dispatch bypasses the
+// wrapper and simply keeps today's behaviour.
+const char kInputEdgeGateChunk[] =
+    "local I = rawget(_G, 'Input')\n"
+    "if type(I) ~= 'table' then return false end\n"
+    "if rawget(I, '__HIGHFPS_EDGE_GATE') then return true end\n"
+    "local at, bt = rawget(I, 'IsActionTriggered'), rawget(I, 'IsButtonTriggered')\n"
+    "if type(at) ~= 'function' or type(bt) ~= 'function' then return false end\n"
+    "I.IsActionTriggered = function(...)\n"
+    "  if HIGH_FPS_INTERMEDIATE then return false end\n"
+    "  return at(...)\n"
+    "end\n"
+    "I.IsButtonTriggered = function(...)\n"
+    "  if HIGH_FPS_INTERMEDIATE then return false end\n"
+    "  return bt(...)\n"
+    "end\n"
+    "I.__HIGHFPS_EDGE_GATE = true\n"
+    "return true\n";
+
+bool g_inputGateInstalled = false;
+int  g_inputGateTries = 0;
+constexpr int kInputGateMaxTries = 2000;   // dispatches before Input exists are few; be generous
+
+// Runs the chunk above in the state. The stack is restored to exactly what the engine
+// left on it, whatever happens: the engine is mid-call, with its callee and arguments
+// already pushed, and anything we leave behind would be taken for one of them.
+void InstallInputEdgeGate(void* L) {
+    ++g_inputGateTries;
+    const int top = g_luaGettop(L);
+    bool ok = false;
+    if (g_luaLoadStr(L, kInputEdgeGateChunk) == 0 &&            // chunk compiled
+        g_realPcallk(L, 0, 1, 0, 0, nullptr) == 0)               // ...and ran
+        ok = g_luaToBool(L, -1) != 0;                            // Input existed, wrapped
+    else {
+        Log("[warn] input edge gate chunk failed to compile or run - gate not installed");
+        g_inputGateTries = kInputGateMaxTries;
+    }
+    g_luaSettop(L, top);
+    if (ok) {
+        g_inputGateInstalled = true;
+        Log("[lua] input edge gate installed - IsActionTriggered/IsButtonTriggered report an "
+            "edge once per input poll, as in vanilla");
+    } else if (g_inputGateTries == kInputGateMaxTries) {
+        Log("[warn] Input table never appeared in the Lua state - input edge gate not installed");
+    }
+}
 
 void PublishPresence(void* L) {
     if (!g_luaPushInt || !g_luaSetGlobal || !L) return;
     if (L != g_lastLuaState) {
         g_lastLuaState = L;
         g_publishedRate = -1;               // force the rate out again for the new VM
+        g_publishedIntermediate = -1;
+        g_inputGateInstalled = false;       // a new VM has a fresh Input table
+        g_inputGateTries = 0;
         g_luaPushInt(L, kNativeApiVersion);
         g_luaSetGlobal(L, "HIGH_FPS_NATIVE");
         // The release version, so the auto-updating Workshop companion can tell the user
@@ -2105,6 +2481,20 @@ void PublishPresence(void* L) {
         g_publishedRate = rate;
         g_luaPushInt(L, rate);
         g_luaSetGlobal(L, "HIGH_FPS_RATE");
+    }
+    // Is the frame this dispatch belongs to one vanilla would never have drawn? Published
+    // for the edge gate below and for any mod that wants to skip per-frame work on such
+    // frames. Changes at most twice per frame, so this is one setglobal per transition.
+    if (g_luaPushBool) {
+        const LONG inter = g_luaFrameIntermediate ? 1 : 0;
+        if (inter != g_publishedIntermediate) {
+            g_publishedIntermediate = inter;
+            g_luaPushBool(L, int(inter));
+            g_luaSetGlobal(L, "HIGH_FPS_INTERMEDIATE");
+        }
+        if (g_cfg.inputEdgeGate && !g_inputGateInstalled && g_inputGateTries < kInputGateMaxTries &&
+            g_luaLoadStr && g_luaToBool && g_luaGettop && g_luaSettop)
+            InstallInputEdgeGate(L);
     }
 }
 
@@ -2153,6 +2543,13 @@ bool AdoptLuaRuntime() {
     g_luaSetGlobal = reinterpret_cast<LuaSetGlobalFn>(GetProcAddress(rt, "lua_setglobal"));
     if (!g_luaPushInt || !g_luaSetGlobal)
         Log("[warn] lua_pushinteger/lua_setglobal missing - mods cannot detect the native part");
+    // Optional too: the input edge gate needs to run a chunk and read back a boolean.
+    // luaL_loadstring is lauxlib, exported by both the game's 5.3 and REPENTOGON's 5.4.
+    g_luaPushBool  = reinterpret_cast<LuaPushBoolFn >(GetProcAddress(rt, "lua_pushboolean"));
+    g_luaToBool    = reinterpret_cast<LuaToBoolFn   >(GetProcAddress(rt, "lua_toboolean"));
+    g_luaLoadStr   = reinterpret_cast<LuaLoadStrFn  >(GetProcAddress(rt, "luaL_loadstring"));
+    if (!g_luaPushBool || !g_luaToBool || !g_luaLoadStr)
+        Log("[warn] lua_pushboolean/lua_toboolean/luaL_loadstring missing - input edge gate off");
 
     // Assigned last, exactly like the file cache: the hooks forward through these on
     // their first line, so they must never be observable half-set.
@@ -2258,10 +2655,13 @@ DWORD WINAPI Init(LPVOID) {
 
     // The overlay compositor's KAGE render path is not ported to 1.9.7.12 (Clear/Flush/
     // shader select were refactored there), so keep it off on that build. High-FPS, smooth
-    // motion and subpixel sprites are unaffected; mod HUDs update at 60 Hz instead.
+    // motion and subpixel sprites are unaffected. Without the overlay the cadence gate
+    // deliberately lets Lua through on every frame (see SuppressLuaNow), so on this build
+    // mod callbacks run at the display rate, as they did before v0.10.0.
     if (isaac::g_isRepentogon && g_cfg.luaOverlay) {
         g_cfg.luaOverlay = false;
-        Log("[note] lua overlay not supported on 1.9.7.12 - disabled; mod graphics run at 60 Hz");
+        Log("[note] lua overlay not supported on 1.9.7.12 - disabled; mod callbacks run at "
+            "the display rate on this build");
     }
 
     // We are loaded as a static import, so DllMain runs before the executable's own
@@ -2269,14 +2669,38 @@ DWORD WINAPI Init(LPVOID) {
     // decrypts .text. Patching now would write into ciphertext and be overwritten (or
     // worse) moments later. Waiting for g_Manager to be populated puts us safely past
     // both the stub and engine construction.
+    //
+    // The slot we poll is itself a build-specific address, and this is the first time we
+    // dereference one. On a build we do not know it is anybody's guess what is there: the
+    // 1.9.7.17 slot sits 0x8CC80 bytes above the 1.9.7.12 one, which on that image lands
+    // inside .bind, the Steam stub, and reads 0x174E5452. That passes the >= 0x10000 test
+    // below, and a release that only knew 1.9.7.17 then dereferenced it at 0x1753000E for
+    // the frameCount log line - which is how v0.13.0 died in the launcher's Repentogon\
+    // folder. The byte checks further down never got a chance to refuse anything, because
+    // this thread was already dead - and it took the game with it. So: check the slot is
+    // mapped before the first read, and check what it holds before the second.
+    uint8_t* mgrSlot = Addr(isaac::kGManagerPtr);
+    if (!Readable(mgrSlot, sizeof(uintptr_t))) {
+        Log("[FATAL] g_Manager slot 0x%08X is not mapped in this image - wrong game build, "
+            "not patching", (unsigned)isaac::kGManagerPtr);
+        return 0;
+    }
     uintptr_t mgr = 0;
     for (int waited = 0; waited < 1200; ++waited) {   // up to ~2 minutes of loading
-        mgr = *reinterpret_cast<uintptr_t*>(Addr(isaac::kGManagerPtr));
+        mgr = *reinterpret_cast<uintptr_t*>(mgrSlot);
         if (mgr >= 0x10000) break;
         Sleep(100);
     }
     if (mgr < 0x10000) {
         Log("[FATAL] g_Manager never initialised (0x%08X) - not patching", (unsigned)mgr);
+        return 0;
+    }
+    // A slot that is mapped but belongs to some other build holds whatever lives there -
+    // relocation entries, resource data - and that "pointer" is the second place a wrong
+    // build could fault us. Same rule: look before dereferencing.
+    if (!Readable(reinterpret_cast<void*>(mgr + isaac::kMgrFrameCount), sizeof(uint32_t))) {
+        Log("[FATAL] g_Manager = 0x%08X does not point at readable memory - wrong game build, "
+            "not patching", (unsigned)mgr);
         return 0;
     }
     Log("g_Manager = 0x%08X, frameCount = %u", (unsigned)mgr,
@@ -2305,6 +2729,11 @@ DWORD WINAPI Init(LPVOID) {
                 "snap-aware camera lock stays on");
     }
 
+    if (g_cfg.rayCadence)
+        Log(InstallRayPhaseGate()
+                ? "stage light rays: phase advance held to real frames - glimmer back at its 60 Hz pace"
+                : "[warn] stage light rays: advance site not recognised - glimmer runs at the display rate");
+
     if (g_cfg.profile) {
         CreateThread(nullptr, 0, SamplerThread, nullptr, 0, nullptr);
         Log("sampling profiler armed - hitches will dump their hottest addresses");
@@ -2331,14 +2760,20 @@ DWORD WINAPI Init(LPVOID) {
                     "real frames (set LuaVanillaCadence=0 if that flickers)");
             }
         } else if (gate) {
+            // SuppressLuaNow only holds Lua back while the overlay is live, so with it off
+            // the gate stays in place but passes every dispatch through.
             g_overlayFailed = true;
-            Log("lua overlay off by config - mod graphics update at 60 Hz and may flicker");
+            Log("lua overlay off - gate installed but idle, mod callbacks run at the display rate");
         }
     }
 
     g_previewEnabled = g_cfg.interpolate;
     Log("intermediate frames %s, MaxFps=%d",
         g_previewEnabled ? "ON (self-computed, no engine calls)" : "OFF (config)", g_cfg.maxFps);
+    if (g_previewEnabled && g_cfg.sceneMotion)
+        Log("scene motion ON: room-transition slide (Game+0x%X) and menu camera (g_MenuManager "
+            "0x%08X) previewed, loop stays uncapped while either moves",
+            (unsigned)isaac::kRoomTransitionInGame, (unsigned)isaac::kGMenuManager);
     return 0;
 }
 

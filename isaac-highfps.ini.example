@@ -23,9 +23,30 @@ LuaVanillaCadence = 1
 ; What mods draw goes onto a surface of its own, which is composited onto every frame.
 ; That is what stops mod HUDs from flickering while their Lua stays at 60 Hz. Costs a
 ; render target switch per Lua dispatch, so it is the most expensive thing here by far.
-; Turn it off only to test whether it is the cause of a rendering problem; with it off,
-; mod graphics appear on one frame in three.
+; Turn it off only to test whether it is the cause of a rendering problem. With it off
+; the cadence above has nothing to carry mod graphics across frames, so it stands down
+; and mod callbacks run once per rendered frame instead. Not available on the REPENTOGON
+; build (1.9.7.12), where it is off regardless of this setting.
 LuaOverlay = 1
+
+; The game polls input 60 times a second. Without this, a mod that asks "was this key
+; just pressed?" from a render callback gets "yes" on every frame rendered until the next
+; poll - two or three times per key press - which is how Mod Config Menu's cursor comes
+; to skip entries. With it, an edge is reported once per poll, exactly as in vanilla.
+; Held state (IsActionPressed) is not touched.
+InputEdgeGate = 1
+
+; The stage light rays (Cathedral, some Basement rooms) advance their glimmer every time
+; they are drawn, so uncapped they pulse 2.75x too fast. This holds that advance to the
+; real 60 Hz frames. Off only if you suspect it of something.
+RayCadence = 1
+
+; Smooth the two things that move while the gameplay clock stands still: the slide
+; between rooms (stepped 30 times a second by the engine) and the main menu's camera
+; (eased 60 times a second). Both are previewed on every rendered frame the same way the
+; room scroll is, and the loop stays at full rate while either is moving. Needs
+; Interpolate = 1. Off, those two run at their engine cadence and the loop rests at 60.
+SceneMotion = 1
 
 ; Per-second timings and hitch reports in %TEMP%\isaac-highfps.log.
 ; Leave it on. It's what makes a bug report worth anything.

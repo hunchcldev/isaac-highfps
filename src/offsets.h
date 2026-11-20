@@ -18,14 +18,24 @@ inline constexpr uintptr_t kImageBase = 0x00400000;
 // ------------------------------------------------------------ build select
 // The game ships as two diverging x86 builds we support with ONE dll: the main-folder
 // Steam build (v1.9.7.17, "J460") and the REPENTOGON build in the Repentogon\ subfolder
-// (v1.9.7.12, "J293"). They are different compilations - every image address moved, three
-// Manager members shifted, and the frame limiter + update wrapper have a different SHAPE
-// (see RemoveFrameLimiter / InstallWrapperHook). Struct member offsets are identical.
+// (v1.9.7.12, "J273" - the version the REPENTOGON launcher pins; its bsdiff patch turns
+// the Steam J460 exe into exactly this file). They are different compilations - every
+// image address moved, three Manager members shifted, and the frame limiter + update
+// wrapper have a different SHAPE (see RemoveFrameLimiter / InstallWrapperHook). Struct
+// member offsets are identical.
 //
 // Detection is the PE TimeDateStamp read from the host exe's in-memory header. The header
 // is NOT encrypted (only .text is, by the Steam DRM stub that runs after us), so this is
 // safe to read at init before anything else - unlike a .text byte probe. It is also
-// rename-proof, unlike keying on the "Repentogon" folder name.
+// rename-proof, unlike keying on the "Repentogon" folder name. The 1.9.7.12 stamp was
+// cross-checked against the launcher's shipped isaac-ng.exe.patch: the bytewise delta it
+// applies to the J460 header turns 0x69E6E3A7 into 0x68154D8D, so the exe the launcher
+// produces today is the one these addresses were taken from.
+//
+// Any stamp that is neither of these leaves the 1.9.7.17 set in place, and from then on the
+// only protection is that every address is checked to be mapped (Readable in dllmain) and
+// every patch site compared byte-for-byte before anything is written. That is what makes an
+// unknown build a no-op rather than a crash, which is what the README promises.
 enum Build { kBuild_1_9_7_17 = 0, kBuild_1_9_7_12 = 1 };
 inline Build g_build = kBuild_1_9_7_17;
 inline bool  g_isRepentogon = false;
@@ -42,8 +52,37 @@ constexpr uint32_t kTimeDateStamp_1_9_7_12 = 0x68154D8D;
 inline uintptr_t kGManagerPtr   = 0x00C7169C;
 inline uintptr_t kGameObjPtr    = 0x00C71678;  // g_Game; was hardcoded in dllmain
 inline uintptr_t kGameTick      = 0x000264F8;  // Game + this = 30 Hz gameplay clock
-inline constexpr uintptr_t kGMenuManager  = 0x00C72A20;  // [SIG] unused by code
+inline uintptr_t kGMenuManager  = 0x00C72A20;  // [SIG]+[VER] g_MenuManager; Manager::Update's menu branch reads it
 inline uintptr_t kGWindowFlags  = 0x00C798E4;  // [VER] bit 0x200 = vsync enabled
+
+// ------------------------------------------------ scene motion: menus, transitions
+// Two more engine values the renderer reads straight out of state that only moves on a
+// fixed cadence, both previewed the way the room scroll is (sample at real frames, write
+// an interpolated value before each render, restore before the engine runs again).
+//
+// Manager::_state: 1 = main menu (MenuManager::Update runs once per 60 Hz wrapper call,
+// no parity gate), 2 = game (the parity-gated phase machine). [VER] both builds, from the
+// state switch in Manager::Update (`mov eax,[this+8]; dec eax; cmp eax,4; ja; jmp [tbl]`).
+inline constexpr uintptr_t kMgrState = 0x8;
+
+// RoomTransition lives inline in Game. [VER] both builds: Game::Update calls its Update
+// through `lea ecx,[game+1B83Ch]` once per 30 Hz tick and returns early while it is
+// active (so the gameplay clock stands still during a slide), and Game::Render draws it
+// instead of the room when _mode is 2 or 3. Update ends by recomputing
+// _progress = float(_counter) / float(_duration); Render eases that as 3t^2 - 2t^3 and
+// offsets both rooms by eased * (ortho + margin) along _direction. Nothing else reads it.
+inline constexpr uintptr_t kRoomTransitionInGame = 0x1B83C;
+inline constexpr uintptr_t kRtMode     = 0x0;   // int: 0 idle, 2/3 = slide drawn by RoomTransition::Render
+inline constexpr uintptr_t kRtCounter  = 0x4;   // int, +1 per tick
+inline constexpr uintptr_t kRtDuration = 0x8;   // int
+inline constexpr uintptr_t kRtProgress = 0xC;   // float, the value Render consumes
+
+// MenuManager::_ViewPosition, the camera the whole main menu is drawn relative to. [VER]
+// both builds: MenuManager::Update eases it toward the selected page's slot every call
+// (snaps when within 1 unit), MenuManager::Render adds it to every element it draws.
+// _moving is the byte Update tests to decide whether to ease at all.
+inline constexpr uintptr_t kMenuViewPosition = 0x44;   // float2
+inline constexpr uintptr_t kMenuMoving       = 0xC;    // byte
 
 // ------------------------------------------------------- Manager members
 // Offsets from *g_Manager. Note REPENTOGON publishes 0x4A8B8 for _framecount and
@@ -115,6 +154,22 @@ inline uintptr_t kSnapScaleB = 0x00BF93E8;  // [VER]+[LIVE] float 2.0
 // floor with a 0.5 addss and a kSnapScaleA reference in the preceding bytes), never by
 // a hardcoded list: the compiler inlined the idiom dozens of times and a list would rot.
 inline uintptr_t kCrtFloor = 0x00AF0917;    // [VER] double floor(double), cdecl
+
+// ------------------------------------------------------ stage light rays
+// FXLayers::Render - the per-stage overlay that draws Cathedral's light shafts and the
+// rays some Basement rooms roll - advances every ray's phase by its speed on every CALL,
+// and Room::Render calls it once per rendered frame. The brightness a few lines up is
+// (sin(phase) + 1) / 2, so vanilla's 60 Hz glimmer becomes a display-rate one under us
+// (issue #9: 2.75x too fast at 165 Hz). This is the address of the three-instruction
+// advance inside the per-ray loop; see InstallRayPhaseGate for the shape it must have.
+// [VER] both builds: unique match for the shape, no branch lands inside it, flags are
+// clobbered by the loop's own `add esi,14h` right after, xmm0 is dead afterwards.
+//   17: F3 0F 10 44 06 04  movss xmm0,[esi+eax+4]   ray.speed
+//       F3 0F 58 44 06 08  addss xmm0,[esi+eax+8]   + ray.phase
+//       F3 0F 11 44 06 08  movss [esi+eax+8],xmm0   ray.phase =
+//       83 C6 14           add esi,14h              next ray (20-byte element)
+//   12: same at 0x96DA9E with the SIB base/index swapped ([eax+esi]).
+inline uintptr_t kRayPhaseAdvance = 0x009955A9;   // [VER] inside FXLayers::Render 0x9948F0
 
 // Entity vtable layout. Slot 4 is the render-preview step; REPENTOGON's own
 // source marks it `skip; // Interpolate`.
@@ -224,6 +279,7 @@ inline void SelectBuild(uint32_t timeDateStamp) {
 
     kGManagerPtr   = 0x00BE4A1C;
     kGameObjPtr    = 0x00BE49F4;
+    kGMenuManager  = 0x00BE5998;   // Manager::Update's menu branch: mov eax,[BE5998h]; cmp [eax+40h],11h
     kGameTick      = 0x00025A70;   // Game::_frameCount (Game.zhl)
     kMgrFrameCount = 0x0004A8B8;   // Manager::_framecount (Manager.zhl); the engine's own
                                    // parity gate reads test byte[mgr+0x4A8B8],1
@@ -241,6 +297,7 @@ inline void SelectBuild(uint32_t timeDateStamp) {
     kGraphicsManager = 0x00BAE190;   // g_KAGE_Graphics_Manager
     kGWindowFlags    = 0x00BAE194;   // +4, as on 1.9.7.17
     kLuaPostRender   = 0x00849DD0;
+    kRayPhaseAdvance = 0x0096DA9E;   // inside FXLayers::Render 0x96CE20
 
     // Overlay pipeline: not ported (see the block that defines these). Zeroed so the
     // overlay refuses to install on this build; dllmain also forces LuaOverlay off.
