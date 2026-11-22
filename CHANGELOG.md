@@ -1,6 +1,49 @@
 # Changelog
 
-## Unreleased
+## v0.14.0
+
+**You can see that it is running.** Nothing on screen used to say so: the companion kept
+quiet when all was well, and a frame counter written in Lua cannot work because the callback
+it would count is the one held at 60. `ShowFps = 1` in the ini now makes the DLL draw the
+rate it measures at the top centre of the screen, through the game's own Lua API and the same
+overlay every mod HUD goes through. The companion says "High FPS active - 180 fps" for a few
+seconds at the start of a run.
+
+**`HIGH_FPS_RATE` and `HIGH_FPS_NATIVE` hold the numbers they were meant to.** Lua's integer
+type is 64 bits wide on 32-bit builds too, and the DLL passed a 32-bit value to
+`lua_pushinteger`. The lower half of what Lua stored was right, the upper half was whatever
+lay next on the stack: a rate of 180 read as `-9223230732430737228`. Nobody saw it because
+nothing displayed the rate by default, and a garbage number is still "present" for a mod
+that only tests whether `HIGH_FPS_NATIVE` exists. Mods comparing either value were wrong.
+
+**The companion can tell "not installed" from "needs an update".** The DLL now announces
+itself with a status (`HIGH_FPS_STATUS`: `starting`, `active`, `unsupported`), and it does so
+on a game build it does not know as well — by hooking the two Lua imports and nothing else,
+a few seconds into the process. `HIGH_FPS_NATIVE` is still only set while frames are being
+added. Until now a DLL that did not know the game version and a missing DLL looked the same
+to the companion.
+
+**Three ways the announcement could go missing are closed.** With `LuaVanillaCadence = 0`
+the Lua hooks were not installed at all, so the companion reported "not installed" on exactly
+the setting the README recommends for troubleshooting; they are now installed regardless and
+merely pass everything through. A VM rebuilt at the address of the one it replaces would be
+taken for already announced; the announcement is now looked up in the VM twice a second and
+published again if it is gone. And every announcement is written to the log, so whether that
+ever happens can be read there.
+
+**The input edge gate actually reports itself installed on the vanilla game.** The game's
+`Input` table refuses keys it does not know (`no writable variable`), so the chunk replaced
+both functions and then threw on its own marker: the wrappers were in, the log said "not
+installed". All writes go through `rawset` now and the marker is set first.
+
+**The Steam build v1.9.7.19 (J511) is supported.** It is v1.9.7.17 with everything moved:
+the update wrapper, the limiter and the parity gate have the same instructions, so they take
+the same patches at new addresses, and the Manager's frame counter and the Game's tick sit
+0x2D0 and 0x10 further into their objects. Entity, Room and RoomTransition offsets did not
+change. The overlay's render-target functions kept their calling conventions but three of
+them open with different instructions, so their guards are now per build; and a render
+target is cleared to the colour it was created with instead of a fixed transparent black,
+which for our transparent layer is the same thing. v1.9.7.17 keeps working from the same DLL.
 
 **The REPENTOGON build of the game is supported.** The launcher does not run the Steam
 executable; it keeps a patched copy (v1.9.7.12.J273) in `Repentogon\` and starts that. It is
@@ -71,29 +114,7 @@ write: the manager slot, the manager pointer it yields, every patch site and bot
 hook shapes. The sub-pixel scan takes its `.text` bounds from the section table instead of
 a 1.9.7.17 constant, so it cannot run on into `.rdata` on a build whose code ends earlier.
 
-## v0.13.0
-
-**The companion can now tell you the DLL is outdated.** The two halves of this mod age
-differently: the Workshop part updates itself, the native part is installed by hand and
-then silently falls behind. The DLL now publishes its release version into the Lua state
-(`HIGH_FPS_VERSION`), and the companion — which is re-uploaded with every native release
-and therefore knows the newest one — shows a short fortune at run start when the installed
-DLL is older. Builds before 0.13.0 never published a version, so its absence identifies
-them exactly and the notice covers them too.
-
-The version string itself now lives in one place, `src/version.h`: the DLL publishes it,
-package.bat names the zip after it, and package.bat reminds us to bump the companion —
-because a version scheme where the two halves can drift apart quietly is how the previous
-"detected by counting callbacks" scheme died.
-
-**The companion no longer cries wolf.** "High FPS is not installed" could appear although
-the DLL was running: the native part announces itself on its first Lua dispatch, which on
-a slow disk lands seconds after mods have loaded, and the companion believed whatever it
-saw first. It now waits a few seconds before showing the launch hint, re-checks at the
-moment the run-start notice would fire instead of trusting a snapshot, and cancels any
-queued notice the instant the native part appears.
-
-## v0.12.0
+## v0.12.0 / v0.13.0
 
 **The big-room shiver is fixed.** Walking through a room large enough to scroll made Isaac
 himself tremble while everything around him moved smoothly — only him, only while moving,
@@ -126,6 +147,26 @@ exact player/scroll state the renderer is about to read. It exists because probi
 game from outside answers a different question: an external reader races the mod's own
 write sequence and mostly catches the sub-millisecond windows between two writes. Off by
 default; costs log I/O when on.
+
+**The companion can now tell you the DLL is outdated.** The two halves of this mod age
+differently: the Workshop part updates itself, the native part is installed by hand and
+then silently falls behind. The DLL now publishes its release version into the Lua state
+(`HIGH_FPS_VERSION`), and the companion — which is re-uploaded with every native release
+and therefore knows the newest one — shows a short on-screen notice at run start when the
+installed DLL is older. Builds before 0.13.0 never published a version, so its absence
+identifies them exactly and the notice covers them too.
+
+The version string itself now lives in one place, `src/version.h`: the DLL publishes it,
+package.bat names the zip after it, and package.bat reminds us to bump the companion —
+because a version scheme where the two halves can drift apart quietly is how the previous
+"detected by counting callbacks" scheme died.
+
+**The companion no longer cries wolf.** "High FPS is not installed" could appear although
+the DLL was running: the native part announces itself on its first Lua dispatch, which on
+a slow disk lands seconds after mods have loaded, and the companion believed whatever it
+saw first. It now waits a few seconds before showing the launch hint, re-checks at the
+moment the run-start notice would fire instead of trusting a snapshot, and cancels any
+queued notice the instant the native part appears.
 
 ## v0.11.0
 

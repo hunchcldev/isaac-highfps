@@ -5,4 +5,4 @@
 // Releasing therefore means: bump this, run package.bat, publish the zip - and bump
 // LATEST in the companion's main.lua and re-upload it, or nobody gets told to update.
 #pragma once
-#define HIGHFPS_VERSION "0.13.0"
+#define HIGHFPS_VERSION "0.14.0"

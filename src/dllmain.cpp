@@ -48,6 +48,8 @@ struct Config {
     bool inputEdgeGate = true;       // report an input edge once per poll, not once per frame
     bool rayCadence = true;          // keep the stage light rays' glimmer at its 60 Hz pace
     bool sceneMotion = true;         // smooth the room-transition slide and the menu camera too
+    bool showFps = false;
+    bool pretendUnsupported = false;
 } g_cfg;
 
 void LoadConfig() {
@@ -70,6 +72,8 @@ void LoadConfig() {
     g_cfg.inputEdgeGate     = GetPrivateProfileIntA("highfps", "InputEdgeGate", 1, path) != 0;
     g_cfg.rayCadence        = GetPrivateProfileIntA("highfps", "RayCadence", 1, path) != 0;
     g_cfg.sceneMotion       = GetPrivateProfileIntA("highfps", "SceneMotion", 1, path) != 0;
+    g_cfg.showFps           = GetPrivateProfileIntA("highfps", "ShowFps", 0, path) != 0;
+    g_cfg.pretendUnsupported = GetPrivateProfileIntA("highfps", "PretendUnsupported", 0, path) != 0;
 }
 
 inline uint8_t* Addr(uintptr_t staticVa) {
@@ -1200,7 +1204,8 @@ bool InstallWrapperHook17() {
             isaac::kManagerUpdateWrp);
         return false;
     }
-    const uint32_t wantOperand = 0x00C5C510u + (g_base - isaac::kImageBase);
+    const uint32_t wantOperand =
+        static_cast<uint32_t>(isaac::kWrapperPushOperand + (g_base - isaac::kImageBase));
     if (site[0] != 0x68 || *reinterpret_cast<uint32_t*>(site + 1) != wantOperand) {
         Log("[FATAL] update wrapper prologue @ 0x%08X: got %02X %08X, expected 68 %08X"
             " - wrong game build?",
@@ -1304,15 +1309,15 @@ bool InstallWrapperHook() {
 bool RemoveFrameLimiter17() {
     static const uint8_t kFlagTest[] = {0x84, 0xDB, 0x75, 0x10};
     static const uint8_t kVsyncJnz[] = {0x0F, 0x85, 0xD0, 0xFE, 0xFF, 0xFF};
-    if (!Expect(0x0093134D, kFlagTest, sizeof kFlagTest, "limiter flag test")) return false;
-    if (!Expect(0x0093135B, kVsyncJnz, sizeof kVsyncJnz, "limiter vsync branch")) return false;
+    if (!Expect(isaac::kLimiterFlagTest, kFlagTest, sizeof kFlagTest, "limiter flag test")) return false;
+    if (!Expect(isaac::kLimiterVsyncJnz, kVsyncJnz, sizeof kVsyncJnz, "limiter vsync branch")) return false;
 
     static const uint8_t kNops[] = {0x90, 0x90, 0x90, 0x90};
-    if (!Poke(0x0093134D, kNops, sizeof kNops)) return false;
+    if (!Poke(isaac::kLimiterFlagTest, kNops, sizeof kNops)) return false;
 
     // jmp 0x931231 : rel32 = 0x931231 - (0x93135B + 5) = -0x12F
     static const uint8_t kJmpLoopHead[] = {0xE9, 0xD1, 0xFE, 0xFF, 0xFF, 0x90};
-    return Poke(0x0093135B, kJmpLoopHead, sizeof kJmpLoopHead);
+    return Poke(isaac::kLimiterVsyncJnz, kJmpLoopHead, sizeof kJmpLoopHead);
 }
 
 // 1.9.7.12 pacing is a different shape - no vsync flag test in main. After the render the
@@ -1611,7 +1616,6 @@ void LearnParentDirW(const wchar_t* path, uint32_t h) {
     RememberDir(h, ok && (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY));
 }
 
-
 uint32_t HashPathW(const wchar_t* s) {
     uint32_t h = 2166136261u;
     for (; *s; ++s) {
@@ -1842,7 +1846,6 @@ struct AttrEntry {
 };
 constexpr uint32_t kAttrSlots = 32768;
 AttrEntry g_attrs[kAttrSlots] = {};
-
 
 bool CacheableW(const wchar_t* p) {
     for (; *p; ++p)
@@ -2248,17 +2251,31 @@ bool InstallOverlay() {
     // We call these rather than patch them, but calling the wrong address is worse than
     // patching it, so each one has to identify itself first. Only the leading bytes are
     // compared: anything further in tends to be an absolute address the loader rebases.
-    static const uint8_t kPush[]   = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08};
-    static const uint8_t kPop[]    = {0x51, 0x83, 0x3D};
-    static const uint8_t kSetRt[]  = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x56};
+    const bool b19 = isaac::g_build == isaac::kBuild_1_9_7_19;
+
+    static const uint8_t kPush17[]  = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08};
+    static const uint8_t kPush19[]  = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x83, 0xEC, 0x08};
+    static const uint8_t kPop[]     = {0x51, 0x83, 0x3D};
+    static const uint8_t kSetRt17[] = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x56};
+    static const uint8_t kSetRt19[] = {0x55, 0x8B, 0xEC, 0x56, 0x8B, 0xF1, 0x57,
+                                       0x8B, 0x7D, 0x08, 0x89, 0x7E, 0x68};
     // `cmp dword [esi+68h], 0` — also proves currentRenderTarget still sits at +0x68.
-    static const uint8_t kClear[]  = {0x56, 0x8B, 0xF1, 0x83, 0x7E, 0x68, 0x00, 0x74};
-    static const uint8_t kFlush[]  = {0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08, 0x83, 0xE4};
-    static const uint8_t kCreate[] = {0x55, 0x8B, 0xEC, 0x6A, 0xFF};
-    if (!Expect(isaac::kPushRenderTarget, kPush,  sizeof kPush,  "PushRenderTarget")  ||
+    static const uint8_t kClear17[] = {0x56, 0x8B, 0xF1, 0x83, 0x7E, 0x68, 0x00, 0x74};
+    static const uint8_t kClear19[] = {0x56, 0x8B, 0xF1, 0x51, 0xC7, 0x46, 0x20, 0x00};
+    static const uint8_t kFlush[]   = {0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08, 0x83, 0xE4};
+    static const uint8_t kCreate[]  = {0x55, 0x8B, 0xEC, 0x6A, 0xFF};
+
+    const uint8_t* push  = b19 ? kPush19  : kPush17;
+    const uint8_t* setRt = b19 ? kSetRt19 : kSetRt17;
+    const uint8_t* clear = b19 ? kClear19 : kClear17;
+    const size_t pushLen  = b19 ? sizeof kPush19  : sizeof kPush17;
+    const size_t setRtLen = b19 ? sizeof kSetRt19 : sizeof kSetRt17;
+    const size_t clearLen = b19 ? sizeof kClear19 : sizeof kClear17;
+
+    if (!Expect(isaac::kPushRenderTarget, push,   pushLen,       "PushRenderTarget")  ||
         !Expect(isaac::kPopRenderTarget,  kPop,   sizeof kPop,   "PopRenderTarget")   ||
-        !Expect(isaac::kSetRenderTarget,  kSetRt, sizeof kSetRt, "SetRenderTarget")   ||
-        !Expect(isaac::kClearTarget,      kClear, sizeof kClear, "ClearRenderTarget") ||
+        !Expect(isaac::kSetRenderTarget,  setRt,  setRtLen,      "SetRenderTarget")   ||
+        !Expect(isaac::kClearTarget,      clear,  clearLen,      "ClearRenderTarget") ||
         !Expect(isaac::kFlushBatches,     kFlush, sizeof kFlush, "FlushRenderBatches")||
         !Expect(isaac::kCreateRenderTgt,  kCreate,sizeof kCreate,"CreateRenderTarget"))
         return false;
@@ -2313,12 +2330,14 @@ bool InstallOverlay() {
 using LuaGettopFn  = int (__cdecl*)(void*);
 using LuaSettopFn  = void(__cdecl*)(void*, int);
 using LuaPushnilFn = void(__cdecl*)(void*);
-using LuaPushIntFn = void(__cdecl*)(void*, intptr_t);
+using LuaPushIntFn = void(__cdecl*)(void*, long long);
 using LuaPushStrFn = const char*(__cdecl*)(void*, const char*);
 using LuaSetGlobalFn = void(__cdecl*)(void*, const char*);
 using LuaPushBoolFn = void(__cdecl*)(void*, int);
 using LuaToBoolFn   = int (__cdecl*)(void*, int);
 using LuaLoadStrFn  = int (__cdecl*)(void*, const char*);   // luaL_loadstring
+using LuaToLStringFn = const char*(__cdecl*)(void*, int, size_t*);
+using LuaGetGlobalFn = int (__cdecl*)(void*, const char*);
 using LuaPcallkFn  = int (__cdecl*)(void*, int, int, int, intptr_t, void*);
 using LuaCallkFn   = void(__cdecl*)(void*, int, int, intptr_t, void*);
 
@@ -2331,6 +2350,8 @@ LuaSetGlobalFn g_luaSetGlobal = nullptr;
 LuaPushBoolFn g_luaPushBool = nullptr;
 LuaToBoolFn   g_luaToBool   = nullptr;
 LuaLoadStrFn  g_luaLoadStr  = nullptr;
+LuaToLStringFn g_luaToLString = nullptr;
+LuaGetGlobalFn g_luaGetGlobal = nullptr;
 LuaPcallkFn  g_realPcallk = nullptr;
 LuaCallkFn   g_realCallk  = nullptr;
 
@@ -2352,7 +2373,7 @@ LuaCallkFn   g_realCallk  = nullptr;
 // actually live. If the overlay is off or has faulted, letting Lua run on every frame
 // costs performance but shows the right picture, and that is the better failure.
 bool SuppressLuaNow() {
-    return g_luaFrameIntermediate && g_inModRenderPass &&
+    return g_cfg.luaVanillaCadence && g_luaFrameIntermediate && g_inModRenderPass &&
            g_cfg.luaOverlay && !g_overlayFailed && g_overlay != nullptr &&
            GetCurrentThreadId() == g_gameThreadId;
 }
@@ -2377,9 +2398,18 @@ void EmulateLuaCall(void* L, int nargs, int nresults) {
 // Both are set from inside a dispatch, where a valid lua_State is in hand. Each push is
 // balanced by the setglobal that pops it, so the stack the engine is mid-call on is
 // untouched. Keyed on the state pointer, so a reloaded VM gets them again.
-constexpr intptr_t kNativeApiVersion = 3;   // 3: HIGH_FPS_INTERMEDIATE + the input edge gate
+constexpr long long kNativeApiVersion = 3;   // 3: HIGH_FPS_INTERMEDIATE + the input edge gate
+
+enum : LONG { kStatusStarting = 0, kStatusActive = 1, kStatusUnsupported = 2 };
+volatile LONG g_status = kStatusStarting;
+LONG g_publishedStatus = -1;
+
+const char* StatusText(LONG s) {
+    return s == kStatusActive ? "active" : s == kStatusUnsupported ? "unsupported" : "starting";
+}
 
 void* g_lastLuaState = nullptr;
+double g_presenceCheckedAt = 0.0;
 LONG g_publishedRate = 0;
 LONG g_publishedIntermediate = -1;
 
@@ -2419,67 +2449,129 @@ const char kInputEdgeGateChunk[] =
     "if rawget(I, '__HIGHFPS_EDGE_GATE') then return true end\n"
     "local at, bt = rawget(I, 'IsActionTriggered'), rawget(I, 'IsButtonTriggered')\n"
     "if type(at) ~= 'function' or type(bt) ~= 'function' then return false end\n"
-    "I.IsActionTriggered = function(...)\n"
+    "rawset(I, '__HIGHFPS_EDGE_GATE', true)\n"
+    "rawset(I, 'IsActionTriggered', function(...)\n"
     "  if HIGH_FPS_INTERMEDIATE then return false end\n"
     "  return at(...)\n"
-    "end\n"
-    "I.IsButtonTriggered = function(...)\n"
+    "end)\n"
+    "rawset(I, 'IsButtonTriggered', function(...)\n"
     "  if HIGH_FPS_INTERMEDIATE then return false end\n"
     "  return bt(...)\n"
-    "end\n"
-    "I.__HIGHFPS_EDGE_GATE = true\n"
+    "end)\n"
     "return true\n";
 
-bool g_inputGateInstalled = false;
-int  g_inputGateTries = 0;
-constexpr int kInputGateMaxTries = 2000;   // dispatches before Input exists are few; be generous
+const char kFpsCounterChunk[] =
+    "if rawget(_G, '__HIGHFPS_COUNTER') then return true end\n"
+    "local Isaac, MC = rawget(_G, 'Isaac'), rawget(_G, 'ModCallbacks')\n"
+    "if Isaac == nil or type(MC) ~= 'table' then return false end\n"
+    "local add, text, width = Isaac.AddCallback, Isaac.RenderText, Isaac.GetScreenWidth\n"
+    "if type(add) ~= 'function' or type(text) ~= 'function' or type(width) ~= 'function'\n"
+    "   or not MC.MC_POST_RENDER then return false end\n"
+    "rawset(_G, '__HIGHFPS_COUNTER', true)\n"
+    "add({ Name = 'High FPS counter' }, MC.MC_POST_RENDER, function()\n"
+    "  local s = tostring(rawget(_G, 'HIGH_FPS_RATE') or 0) .. ' fps'\n"
+    "  text(s, (width() - #s * 6) * 0.5, 3, 1, 1, 1, 0.7)\n"
+    "end, -1)\n"
+    "return true\n";
+
+struct LuaSetup {
+    const char* what;
+    const char* chunk;
+    bool installed = false;
+    bool errorLogged = false;
+    int  tries = 0;
+    void Reset() { installed = false; errorLogged = false; tries = 0; }
+};
+constexpr int kLuaSetupMaxTries = 2000;
+
+LuaSetup g_inputGate  = {"input edge gate", kInputEdgeGateChunk};
+LuaSetup g_fpsCounter = {"fps counter", kFpsCounterChunk};
 
 // Runs the chunk above in the state. The stack is restored to exactly what the engine
 // left on it, whatever happens: the engine is mid-call, with its callee and arguments
 // already pushed, and anything we leave behind would be taken for one of them.
-void InstallInputEdgeGate(void* L) {
-    ++g_inputGateTries;
+bool RunLuaSetup(void* L, LuaSetup& s) {
+    ++s.tries;
     const int top = g_luaGettop(L);
     bool ok = false;
-    if (g_luaLoadStr(L, kInputEdgeGateChunk) == 0 &&            // chunk compiled
+    if (g_luaLoadStr(L, s.chunk) == 0 &&                         // chunk compiled
         g_realPcallk(L, 0, 1, 0, 0, nullptr) == 0)               // ...and ran
         ok = g_luaToBool(L, -1) != 0;                            // Input existed, wrapped
-    else {
-        Log("[warn] input edge gate chunk failed to compile or run - gate not installed");
-        g_inputGateTries = kInputGateMaxTries;
+    else if (!s.errorLogged) {
+        s.errorLogged = true;
+        const char* why = g_luaToLString ? g_luaToLString(L, -1, nullptr) : nullptr;
+        Log("[note] %s chunk could not run yet (%s) - retrying on later dispatches",
+            s.what, why ? why : "no error text");
     }
     g_luaSettop(L, top);
-    if (ok) {
-        g_inputGateInstalled = true;
+    s.installed = ok;
+    return ok;
+}
+
+void InstallInputEdgeGate(void* L) {
+    if (RunLuaSetup(L, g_inputGate))
         Log("[lua] input edge gate installed - IsActionTriggered/IsButtonTriggered report an "
             "edge once per input poll, as in vanilla");
-    } else if (g_inputGateTries == kInputGateMaxTries) {
+    else if (g_inputGate.tries == kLuaSetupMaxTries)
         Log("[warn] Input table never appeared in the Lua state - input edge gate not installed");
-    }
+}
+
+void InstallFpsCounter(void* L) {
+    if (RunLuaSetup(L, g_fpsCounter))
+        Log("[lua] fps counter installed - the measured rate is drawn at the top of the screen");
+    else if (g_fpsCounter.tries == kLuaSetupMaxTries)
+        Log("[warn] Isaac.AddCallback never appeared in the Lua state - fps counter not installed");
 }
 
 void PublishPresence(void* L) {
     if (!g_luaPushInt || !g_luaSetGlobal || !L) return;
-    if (L != g_lastLuaState) {
+
+    if (L == g_lastLuaState && g_luaGetGlobal && g_luaPushStr && g_luaGettop && g_luaSettop) {
+        const double now = Now();
+        if (now - g_presenceCheckedAt >= 0.5) {
+            g_presenceCheckedAt = now;
+            const int top = g_luaGettop(L);
+            const bool gone = g_luaGetGlobal(L, "HIGH_FPS_STATUS") == 0;
+            g_luaSettop(L, top);
+            if (gone) {
+                Log("[lua] announcement missing from state 0x%08X although it was published "
+                    "there - the VM was rebuilt at the same address, publishing again",
+                    (unsigned)reinterpret_cast<uintptr_t>(L));
+                g_lastLuaState = nullptr;
+            }
+        }
+    }
+
+    const LONG status = g_status;
+    if (L != g_lastLuaState || status != g_publishedStatus) {
+        Log("[lua] announcing in state 0x%08X: HIGH_FPS_STATUS = %s, HIGH_FPS_VERSION = %s",
+            (unsigned)reinterpret_cast<uintptr_t>(L), StatusText(status), HIGHFPS_VERSION);
         g_lastLuaState = L;
+        g_publishedStatus = status;
         g_publishedRate = -1;               // force the rate out again for the new VM
         g_publishedIntermediate = -1;
-        g_inputGateInstalled = false;       // a new VM has a fresh Input table
-        g_inputGateTries = 0;
-        g_luaPushInt(L, kNativeApiVersion);
-        g_luaSetGlobal(L, "HIGH_FPS_NATIVE");
+        g_inputGate.Reset();                // a new VM has a fresh Input table
+        g_fpsCounter.Reset();
         // The release version, so the auto-updating Workshop companion can tell the user
         // when this hand-installed DLL has fallen behind. Absent on builds before 0.13.0,
         // which is itself the information "0.12.0 or older".
         if (g_luaPushStr) {
             g_luaPushStr(L, HIGHFPS_VERSION);
             g_luaSetGlobal(L, "HIGH_FPS_VERSION");
+            g_luaPushStr(L, StatusText(status));
+            g_luaSetGlobal(L, "HIGH_FPS_STATUS");
+        }
+        if (status == kStatusActive) {
+            g_luaPushInt(L, kNativeApiVersion);
+            g_luaSetGlobal(L, "HIGH_FPS_NATIVE");
         }
     }
+    if (status != kStatusActive) return;
+
     const LONG rate = g_pushRate;
     if (rate != g_publishedRate) {
         g_publishedRate = rate;
-        g_luaPushInt(L, rate);
+        g_luaPushInt(L, static_cast<long long>(rate));
         g_luaSetGlobal(L, "HIGH_FPS_RATE");
     }
     // Is the frame this dispatch belongs to one vanilla would never have drawn? Published
@@ -2492,9 +2584,13 @@ void PublishPresence(void* L) {
             g_luaPushBool(L, int(inter));
             g_luaSetGlobal(L, "HIGH_FPS_INTERMEDIATE");
         }
-        if (g_cfg.inputEdgeGate && !g_inputGateInstalled && g_inputGateTries < kInputGateMaxTries &&
-            g_luaLoadStr && g_luaToBool && g_luaGettop && g_luaSettop)
+        const bool canRunLua = g_luaLoadStr && g_luaToBool && g_luaGettop && g_luaSettop;
+        if (canRunLua && g_cfg.inputEdgeGate && !g_inputGate.installed &&
+            g_inputGate.tries < kLuaSetupMaxTries)
             InstallInputEdgeGate(L);
+        if (canRunLua && g_cfg.showFps && !g_fpsCounter.installed &&
+            g_fpsCounter.tries < kLuaSetupMaxTries)
+            InstallFpsCounter(L);
     }
 }
 
@@ -2548,6 +2644,8 @@ bool AdoptLuaRuntime() {
     g_luaPushBool  = reinterpret_cast<LuaPushBoolFn >(GetProcAddress(rt, "lua_pushboolean"));
     g_luaToBool    = reinterpret_cast<LuaToBoolFn   >(GetProcAddress(rt, "lua_toboolean"));
     g_luaLoadStr   = reinterpret_cast<LuaLoadStrFn  >(GetProcAddress(rt, "luaL_loadstring"));
+    g_luaToLString = reinterpret_cast<LuaToLStringFn>(GetProcAddress(rt, "lua_tolstring"));
+    g_luaGetGlobal = reinterpret_cast<LuaGetGlobalFn>(GetProcAddress(rt, "lua_getglobal"));
     if (!g_luaPushBool || !g_luaToBool || !g_luaLoadStr)
         Log("[warn] lua_pushboolean/lua_toboolean/luaL_loadstring missing - input edge gate off");
 
@@ -2594,6 +2692,21 @@ void RearmLuaGateIfRepointed() {
         Log("[lua] import table was re-pointed after install (REPENTOGON?) - gate re-armed");
     else
         Log("[warn] lua import table re-pointed and re-adoption failed - gate is off");
+}
+
+constexpr double kAnnounceAfterSeconds = 3.0;
+
+DWORD AnnounceWithoutPatching(LONG status) {
+    g_status = status;
+    if (g_realPcallk) return 0;
+    const double up = Now();
+    if (up < kAnnounceAfterSeconds) Sleep(DWORD((kAnnounceAfterSeconds - up) * 1000.0));
+    if (InstallLuaGate())
+        Log("[note] lua import hooks installed to announce '%s' to the Workshop companion - "
+            "no game code is touched", StatusText(status));
+    else
+        Log("[note] lua imports not found - the Workshop companion will report 'not installed'");
+    return 0;
 }
 
 DWORD WINAPI Init(LPVOID) {
@@ -2649,8 +2762,10 @@ DWORD WINAPI Init(LPVOID) {
         (unsigned)g_base, (unsigned)(g_base - isaac::kImageBase));
     Log("host exe = %s", host);
     Log("build = %s (PE TimeDateStamp 0x%08X)",
-        isaac::g_isRepentogon ? "1.9.7.12 / REPENTOGON" :
-        (tds == isaac::kTimeDateStamp_1_9_7_17 ? "1.9.7.17 / Steam" : "UNKNOWN - using 1.9.7.17 offsets"),
+        isaac::g_isRepentogon                        ? "1.9.7.12 / REPENTOGON" :
+        isaac::g_build == isaac::kBuild_1_9_7_19     ? "1.9.7.19 / Steam" :
+        tds == isaac::kTimeDateStamp_1_9_7_17        ? "1.9.7.17 / Steam"
+                                                     : "UNKNOWN - using 1.9.7.17 offsets",
         tds);
 
     // The overlay compositor's KAGE render path is not ported to 1.9.7.12 (Clear/Flush/
@@ -2662,6 +2777,11 @@ DWORD WINAPI Init(LPVOID) {
         g_cfg.luaOverlay = false;
         Log("[note] lua overlay not supported on 1.9.7.12 - disabled; mod callbacks run at "
             "the display rate on this build");
+    }
+
+    if (g_cfg.pretendUnsupported) {
+        Log("[test] PretendUnsupported = 1 - behaving as on a game build we do not know");
+        return AnnounceWithoutPatching(kStatusUnsupported);
     }
 
     // We are loaded as a static import, so DllMain runs before the executable's own
@@ -2683,17 +2803,18 @@ DWORD WINAPI Init(LPVOID) {
     if (!Readable(mgrSlot, sizeof(uintptr_t))) {
         Log("[FATAL] g_Manager slot 0x%08X is not mapped in this image - wrong game build, "
             "not patching", (unsigned)isaac::kGManagerPtr);
-        return 0;
+        return AnnounceWithoutPatching(kStatusUnsupported);
     }
     uintptr_t mgr = 0;
     for (int waited = 0; waited < 1200; ++waited) {   // up to ~2 minutes of loading
         mgr = *reinterpret_cast<uintptr_t*>(mgrSlot);
         if (mgr >= 0x10000) break;
+        if (waited == 100) AnnounceWithoutPatching(kStatusStarting);
         Sleep(100);
     }
     if (mgr < 0x10000) {
         Log("[FATAL] g_Manager never initialised (0x%08X) - not patching", (unsigned)mgr);
-        return 0;
+        return AnnounceWithoutPatching(kStatusUnsupported);
     }
     // A slot that is mapped but belongs to some other build holds whatever lives there -
     // relocation entries, resource data - and that "pointer" is the second place a wrong
@@ -2701,7 +2822,7 @@ DWORD WINAPI Init(LPVOID) {
     if (!Readable(reinterpret_cast<void*>(mgr + isaac::kMgrFrameCount), sizeof(uint32_t))) {
         Log("[FATAL] g_Manager = 0x%08X does not point at readable memory - wrong game build, "
             "not patching", (unsigned)mgr);
-        return 0;
+        return AnnounceWithoutPatching(kStatusUnsupported);
     }
     Log("g_Manager = 0x%08X, frameCount = %u", (unsigned)mgr,
         *reinterpret_cast<uint32_t*>(mgr + isaac::kMgrFrameCount));
@@ -2712,10 +2833,16 @@ DWORD WINAPI Init(LPVOID) {
     // Order matters: the hook is what keeps gameplay at its normal speed, so it goes in
     // first. Removing the limiter without it leaves the game running at display rate,
     // i.e. several times too fast.
-    if (!InstallWrapperHook()) { Log("wrapper hook FAILED - leaving the game untouched"); return 0; }
+    if (!InstallWrapperHook()) {
+        Log("wrapper hook FAILED - leaving the game untouched");
+        return AnnounceWithoutPatching(kStatusUnsupported);
+    }
     Log("wrapper hook installed, logic cadence pinned to %.2f Hz", 1.0 / kWrapperPeriod);
 
-    if (!RemoveFrameLimiter()) { Log("limiter patch FAILED - hook is live, game stays at 60"); return 0; }
+    if (!RemoveFrameLimiter()) {
+        Log("limiter patch FAILED - hook is live, game stays at 60");
+        return AnnounceWithoutPatching(kStatusUnsupported);
+    }
     Log("limiter removed - render loop now free-running");
 
     if (g_cfg.subpixelSprites) {
@@ -2743,15 +2870,22 @@ DWORD WINAPI Init(LPVOID) {
         Log(InstallFileCache() ? "file-probe cache installed (_access via import table)"
                                : "[warn] could not hook _access - file-probe cache off");
 
-    if (g_cfg.luaVanillaCadence) {
-        const bool gate = InstallLuaGate();
-        Log(gate ? "lua gate installed (lua_pcallk/lua_callk via import table) - "
-                   "mod callbacks pinned to the vanilla 60 Hz cadence"
-                 : "[warn] lua gate failed - mod callbacks will fire per rendered frame");
+    g_status = kStatusActive;
+    const bool gate = InstallLuaGate();
+    if (!gate) {
+        Log("[warn] lua hooks failed - mods cannot see the native part, and mod callbacks "
+            "will fire per rendered frame");
+    } else if (!g_cfg.luaVanillaCadence) {
+        g_overlayFailed = true;
+        Log("lua hooks installed for presence only (LuaVanillaCadence=0) - mod callbacks run "
+            "at the display rate");
+    } else {
+        Log("lua gate installed (lua_pcallk/lua_callk via import table) - "
+            "mod callbacks pinned to the vanilla 60 Hz cadence");
 
         // The overlay only has a job while the gate is holding Lua back. Without the gate
         // mods already draw on every frame and there is nothing to carry over.
-        if (gate && g_cfg.luaOverlay) {
+        if (g_cfg.luaOverlay) {
             if (InstallOverlay()) {
                 Log("lua overlay armed - mod graphics will be composited onto every frame");
             } else {
@@ -2759,7 +2893,7 @@ DWORD WINAPI Init(LPVOID) {
                 Log("[warn] lua overlay could not install - mod graphics will only appear on "
                     "real frames (set LuaVanillaCadence=0 if that flickers)");
             }
-        } else if (gate) {
+        } else {
             // SuppressLuaNow only holds Lua back while the overlay is live, so with it off
             // the gate stays in place but passes every dispatch through.
             g_overlayFailed = true;

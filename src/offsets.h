@@ -36,9 +36,10 @@ inline constexpr uintptr_t kImageBase = 0x00400000;
 // only protection is that every address is checked to be mapped (Readable in dllmain) and
 // every patch site compared byte-for-byte before anything is written. That is what makes an
 // unknown build a no-op rather than a crash, which is what the README promises.
-enum Build { kBuild_1_9_7_17 = 0, kBuild_1_9_7_12 = 1 };
+enum Build { kBuild_1_9_7_17 = 0, kBuild_1_9_7_12 = 1, kBuild_1_9_7_19 = 2 };
 inline Build g_build = kBuild_1_9_7_17;
 inline bool  g_isRepentogon = false;
+constexpr uint32_t kTimeDateStamp_1_9_7_19 = 0x6B01D5E1;
 constexpr uint32_t kTimeDateStamp_1_9_7_17 = 0x69E6E3A7;
 constexpr uint32_t kTimeDateStamp_1_9_7_12 = 0x68154D8D;
 
@@ -180,7 +181,7 @@ inline constexpr int kVtRender      = 5;   // +0x14
 // ------------------------------------------------------------- functions
 inline constexpr uintptr_t kIsaacMain        = 0x00931050;  // [SIG]+[VER] confirmed as main()
 inline constexpr uintptr_t kManagerRender    = 0x009555C0;  // [SIG] anchor 0x955C8A lands inside
-inline constexpr uintptr_t kManagerUpdateWrp = 0x009AB6D0;  // [VER] thin wrapper -> phase machine
+inline uintptr_t           kManagerUpdateWrp = 0x009AB6D0;  // [VER] thin wrapper -> phase machine
 inline constexpr uintptr_t kPhaseMachine     = 0x00954CD0;  // [VER] takes a bool; re-entrant!
 inline constexpr uintptr_t kInterpStep       = 0x006FD3F0;  // [VER] the odd-frame substep driver
 inline constexpr uintptr_t kEntityUpdateBase = 0x006AE820;  // [VER] the ONE gameplay integrator
@@ -190,6 +191,11 @@ inline constexpr uintptr_t kGameIsPaused     = 0x006FD350;  // [SIG]
 inline constexpr uintptr_t kGetRenderPosition= 0x0067F310;  // [SIG]
 
 // ------------------------------------------------------------ patch sites
+inline uintptr_t kWrapperPushOperand = 0x00C5C510;
+
+inline uintptr_t kLimiterFlagTest = 0x0093134D;
+inline uintptr_t kLimiterVsyncJnz = 0x0093135B;
+
 // The 1/60 limiter constant. THREE readers in main(), not two — the third is a
 // watchdog comparing (1/60)/dt against 1.1 and force-enabling the limiter after
 // 30 consecutive fast frames. Missing it means the cap silently comes back.
@@ -273,6 +279,45 @@ inline constexpr uintptr_t kGateParity = 0x009551CF;
 // are not here - those live in their build-specific patch functions in dllmain, because
 // the code shape differs, not just the address.
 inline void SelectBuild(uint32_t timeDateStamp) {
+    if (timeDateStamp == kTimeDateStamp_1_9_7_19) {
+        g_build = kBuild_1_9_7_19;
+
+        kGManagerPtr   = 0x00C9A094;
+        kGameObjPtr    = 0x00C994F8;
+        kGMenuManager  = 0x00C9A8A4;
+        kGameTick      = 0x00026508;
+        kMgrFrameCount = 0x0004AE8C;
+
+        kManagerUpdateWrp   = 0x009C27B0;
+        kWrapperPushOperand = 0x00C83FF4;
+        kLimiterFlagTest    = 0x009464AD;
+        kLimiterVsyncJnz    = 0x009464BB;
+
+        kConstHalfShared = 0x00BCE410;
+        kConst065        = 0x00BCE468;
+        kSnapScaleA      = 0x00C203E8;
+        kSnapScaleB      = 0x00C20420;
+        kCrtFloor        = 0x00B111A7;
+        kRayPhaseAdvance = 0x009AC786;
+
+        kGraphicsManager = 0x00C9E850;
+        kGWindowFlags    = 0x00C9E854;
+        kScreenWidth     = 0x00C9DFD4;
+        kScreenHeight    = 0x00C9DFD8;
+        kOrthoWidth      = 0x00C9DD7C;
+        kOrthoHeight     = 0x00C9DFD0;
+        kCurrentShader   = 0x00C5EF08;
+
+        kPushRenderTarget = 0x0068A760;
+        kPopRenderTarget  = 0x0068A7B0;
+        kSetRenderTarget  = 0x00A31870;
+        kClearTarget      = 0x00A317C0;
+        kFlushBatches     = 0x00A325D0;
+        kSelectShader     = 0x00A2D5D0;
+        kCreateRenderTgt  = 0x00A2B220;
+        kLuaPostRender    = 0x0086D040;
+        return;
+    }
     if (timeDateStamp != kTimeDateStamp_1_9_7_12) return;   // defaults already = 1.9.7.17
     g_build = kBuild_1_9_7_12;
     g_isRepentogon = true;

@@ -20,6 +20,12 @@ MaxFps = 0
 ; callbacks run three times too fast.
 LuaVanillaCadence = 1
 
+; The game rounds every sprite to its internal pixel grid before drawing. Against the
+; mod's smoothly scrolling camera that rounding shows up as one-pixel jitter on moving
+; things, so the mod patches it out and sprites render at their true positions. 0 keeps
+; the vanilla rounding (and the mod's snap-aware camera lock for the player).
+SubpixelSprites = 1
+
 ; What mods draw goes onto a surface of its own, which is composited onto every frame.
 ; That is what stops mod HUDs from flickering while their Lua stays at 60 Hz. Costs a
 ; render target switch per Lua dispatch, so it is the most expensive thing here by far.
@@ -47,6 +53,11 @@ RayCadence = 1
 ; room scroll is, and the loop stays at full rate while either is moving. Needs
 ; Interpolate = 1. Off, those two run at their engine cadence and the loop rests at 60.
 SceneMotion = 1
+
+; Draws the frame rate the mod measures at the top centre of the screen, e.g. "180 fps".
+; It is the quickest way to see that the mod is running. While the game is paused or
+; nothing moves the loop rests on purpose, so it reads 60 there.
+ShowFps = 0
 
 ; Per-second timings and hitch reports in %TEMP%\isaac-highfps.log.
 ; Leave it on. It's what makes a bug report worth anything.
